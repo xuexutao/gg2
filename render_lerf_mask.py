@@ -21,7 +21,8 @@ import numpy as np
 from PIL import Image
 import cv2
 
-from ext.grounded_sam import grouned_sam_output, load_model_hf, select_obj_ioa
+from ext.grounded_sam import (grouned_sam_output, load_model_hf, load_model_local, resolve_local_groundingdino_paths, select_obj_ioa)
+
 from segment_anything import sam_model_registry, SamPredictor
 
 from render import feature_to_rgb, visualize_obj
@@ -99,16 +100,37 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         # grounding-dino
         # Use this command for evaluate the Grounding DINO model
         # Or you can download the model by yourself
-        ckpt_repo_id = "ShilongLiu/GroundingDINO"
-        ckpt_filenmae = "groundingdino_swinb_cogcoor.pth"
-        ckpt_config_filename = "GroundingDINO_SwinB.cfg.py"
-        groundingdino_model = load_model_hf(ckpt_repo_id, ckpt_filenmae, ckpt_config_filename)
+        print("Loading Grounding DINO model...")
+
+        # Prefer local checkpoints in Tracking-Anything-with-DEVA/saves/.
+        # Fallback to HuggingFace if missing.
+        local_ckpt_candidates = [
+            os.path.join("Tracking-Anything-with-DEVA", "saves", "groundingdino_swint_ogc.pth"),
+        ]
+        local_cfg_candidates = [
+            os.path.join("Tracking-Anything-with-DEVA", "saves", "GroundingDINO_SwinT_OGC.py"),
+        ]
+
+        local_ckpt, local_cfg = resolve_local_groundingdino_paths(local_ckpt_candidates, local_cfg_candidates)
+        if local_ckpt and local_cfg:
+            print(f"Using local GroundingDINO: ckpt={local_ckpt}, cfg={local_cfg}")
+            groundingdino_model = load_model_local(local_cfg, local_ckpt)
+        else:
+            ckpt_repo_id = "ShilongLiu/GroundingDINO"
+            ckpt_filenmae = "groundingdino_swinb_cogcoor.pth"
+            ckpt_config_filename = "GroundingDINO_SwinB.cfg.py"
+            print("Local GroundingDINO not found, fallback to HuggingFace download...")
+            groundingdino_model = load_model_hf(ckpt_repo_id, ckpt_filenmae, ckpt_config_filename)
+        print("Grounding DINO model loaded.")
+
 
         # sam-hq
+        print("Loading SAM-HQ model...")
         sam_checkpoint = 'Tracking-Anything-with-DEVA/saves/sam_vit_h_4b8939.pth'
         sam = sam_model_registry["vit_h"](checkpoint=sam_checkpoint)
         sam.to(device='cuda')
         sam_predictor = SamPredictor(sam)
+        print("SAM-HQ model loaded.")
 
         # Text prompt
         if 'figurines' in dataset.model_path:

@@ -25,6 +25,38 @@ import matplotlib.pyplot as plt
 
 from huggingface_hub import hf_hub_download
 
+
+def _load_groundingdino_checkpoint_into_model(model, ckpt_path: str):
+    checkpoint = torch.load(ckpt_path, map_location='cpu')
+    state = checkpoint.get('model', checkpoint)
+    log = model.load_state_dict(clean_state_dict(state), strict=False)
+    print("Model loaded from {} \n => {}".format(ckpt_path, log))
+    _ = model.eval()
+    return model
+
+
+def load_model_local(model_config_path: str, model_checkpoint_path: str, device: str = 'cpu'):
+    """Load GroundingDINO from local config + checkpoint without HF."""
+    args = SLConfig.fromfile(model_config_path)
+    model = build_model(args)
+    args.device = device
+    return _load_groundingdino_checkpoint_into_model(model, model_checkpoint_path)
+
+
+def resolve_local_groundingdino_paths(
+    local_ckpt_candidates,
+    local_cfg_candidates,
+):
+    """Pick the first existing (ckpt, cfg) pair from candidate lists."""
+    for ckpt in local_ckpt_candidates:
+        if not ckpt or not os.path.isfile(ckpt):
+            continue
+        for cfg in local_cfg_candidates:
+            if not cfg or not os.path.isfile(cfg):
+                continue
+            return ckpt, cfg
+    return None, None
+
 def load_model_hf(repo_id, filename, ckpt_config_filename, device='cpu'):
     cache_config_file = hf_hub_download(repo_id=repo_id, filename=ckpt_config_filename)
 
@@ -33,11 +65,7 @@ def load_model_hf(repo_id, filename, ckpt_config_filename, device='cpu'):
     args.device = device
 
     cache_file = hf_hub_download(repo_id=repo_id, filename=filename)
-    checkpoint = torch.load(cache_file, map_location='cpu')
-    log = model.load_state_dict(clean_state_dict(checkpoint['model']), strict=False)
-    print("Model loaded from {} \n => {}".format(cache_file, log))
-    _ = model.eval()
-    return model   
+    return _load_groundingdino_checkpoint_into_model(model, cache_file)
 
 def show_mask(mask, image, random_color=True):
     if random_color:
@@ -113,5 +141,4 @@ def select_obj_ioa(classification_maps, mask, ioa_thresh=0.7):
             classes_above_threshold.append(class_id)
 
     return torch.tensor(classes_above_threshold).cuda()
-
 

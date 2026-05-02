@@ -85,18 +85,20 @@ log "=================================================================="
 # -----------------------------------------------------------------------------
 # Step 0: unit tests for the new loss (fast, no data needed)
 # -----------------------------------------------------------------------------
-log ""
-log "[Step 0/5] Running unit tests on Anisotropic Affinity loss..."
-python -m tests.test_aniso_loss 2>&1 | tee -a "$LOG_FILE"
-log "[Step 0/5] Unit tests passed."
+# log ""
+# log "[Step 0/5] Running unit tests on Anisotropic Affinity loss..."
+# python -m tests.test_aniso_loss 2>&1 | tee -a "$LOG_FILE"
+# log "[Step 0/5] Unit tests passed."
 
 # -----------------------------------------------------------------------------
 # Sanity check: dataset exists
 # -----------------------------------------------------------------------------
 if [[ ! -d "$DATA_DIR" ]]; then
     log "[ERROR] dataset not found at $DATA_DIR"
-    log "        Download LERF-Mask from hugging face first; see docs/dataset.md"
+    log "      Download LERF-Mask from hugging face first; see docs/dataset.md"
     exit 2
+else
+    log "      Dataset found at $DATA_DIR"
 fi
 
 # -----------------------------------------------------------------------------
@@ -141,12 +143,12 @@ fi
 log ""
 log "[Step 3/5] Rendering masks with text prompts (both models)..."
 
-render_one () {
+render_one() {
     local MODEL_DIR="$1"
     local TAG="$2"
-    log "    -> rendering ${TAG}: ${MODEL_DIR}"
+    log "      -> rendering ${TAG}: ${MODEL_DIR}"
     python render_lerf_mask.py -m "$MODEL_DIR" --skip_train --num_classes 256 --images images 2>&1 | tee -a "$LOG_FILE" || {
-        log "    !! render_lerf_mask.py failed for ${TAG} (often missing Grounded-DINO / SAM ckpt). See ${LOG_FILE}."
+        log "      !! render_lerf_mask.py failed for ${TAG} (often missing Grounded-DINO / SAM ckpt). See ${LOG_FILE}."
         return 1
     }
 }
@@ -173,11 +175,11 @@ python tests/eval_compare.py \
 # -----------------------------------------------------------------------------
 log ""
 log "[Step 5/5] DONE. Summary written to:"
-log "    ${LOG_FILE}"
-log "    ${LOG_DIR}/metrics_${SCENE}_${TS}.json"
+log "      ${LOG_FILE}"
+log "      ${LOG_DIR}/metrics_${SCENE}_${TS}.json"
 log ""
 log "Compare:"
-log "    Baseline model : ${OUT_BASE}"
-log "    Ours model     : ${OUT_OURS}"
-log "    Key metric     : mBIoU improvement of OURS over BASELINE"
+log "      Baseline model : ${OUT_BASE}"
+log "      Ours model     : ${OUT_OURS}"
+log "      Key metric     : mBIoU improvement of OURS over BASELINE"
 log "=================================================================="

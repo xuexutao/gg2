@@ -115,6 +115,18 @@ def safe_state(silent):
         def __init__(self, silent):
             self.silent = silent
 
+        def isatty(self):
+            # Some libraries (e.g. transformers) check TTY via sys.stdout.isatty().
+            # Keep behavior consistent with the original stdout when possible.
+            try:
+                return old_f.isatty()
+            except Exception:
+                return False
+
+        def __getattr__(self, name):
+            # Proxy other attributes (e.g. encoding, fileno, etc.) to the original stdout.
+            return getattr(old_f, name)
+
         def write(self, x):
             if not self.silent:
                 if x.endswith("\n"):
@@ -130,4 +142,5 @@ def safe_state(silent):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(torch.device("cuda:0"))
