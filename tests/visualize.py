@@ -7,15 +7,14 @@ Produces the key figures you'll put in the paper:
       Figure 1 (teaser): synthetic thin-wall toy. Euclidean KNN connects the
       two faces into one blob; Anisotropic KNN separates them cleanly.
 
-  vis_compare_<scene>_<view_idx>.png
+  vis_compare_<scene>_<prompt>_<view_idx>.png
       Figure 2/3 (real scenes): side-by-side
-          [ RGB | GT colored | Baseline pred | Ours pred ]
-      using the predicted-object visualization that render.py already emits.
-      Also crops a zoom-in panel to highlight boundary differences.
+          [ RGB | GT mask | Baseline mask | Ours mask ]
+      using the text-prompt masks rendered by render_lerf_mask.py.
 
-  vis_ablation_<scene>_<view_idx>.png
+  vis_ablation_<scene>_<prompt>_<view_idx>.png
       Figure 4 (ablation): five columns
-          [ RGB | Baseline | +Aniso | +Aniso+Normal | GT ]
+          [ RGB | Baseline mask | +Aniso mask | +Aniso+Normal mask | GT mask ]
 
   vis_identity_pca_<scene>.png
       Figure 5: PCA of the 16-d Identity Encoding over the 3D Gaussian
@@ -31,6 +30,7 @@ Usage:
         --baseline_model output/verify_figurines_baseline \
         --ours_model     output/verify_figurines_aniso \
         --iteration 30000 \
+        --text_prompt "green apple" \
         --view_indices 0 1 2
 
     # 3) Ablation (requires 3 trained runs)
@@ -40,6 +40,7 @@ Usage:
         --aniso_only_model output/verify_figurines_aniso_only \
         --ours_model       output/verify_figurines_aniso \
         --iteration 30000 \
+        --text_prompt "green apple" \
         --view_indices 0 1
 
     # 4) 3D Identity PCA scatter
@@ -227,6 +228,22 @@ def _load_png(p):
     return np.array(Image.open(p))
 
 
+def _prompt_to_png_name(text_prompt: str) -> str:
+    p = (text_prompt or "").strip()
+    if p.lower().endswith(".png"):
+        return p
+    return p + ".png"
+
+
+def _infer_first_prompt_from_output(model_dir: str, iteration: int, split: str = "test"):
+    base = Path(model_dir) / split / f"ours_{iteration}_text" / "test_mask" / "0"
+    if not base.exists():
+        return None
+    for p in sorted(base.glob("*.png")):
+        return p.stem
+    return None
+
+
 def _zoom_inset(img, x, y, w, h, factor=3):
     """Crop img[y:y+h, x:x+w] and upscale by `factor`."""
     crop = img[y : y + h, x : x + w]
@@ -235,8 +252,18 @@ def _zoom_inset(img, x, y, w, h, factor=3):
     )
 
 
-def _hstack_with_titles(panels, titles, pad=8, title_h=28, bg=(255, 255, 255)):
-    """Assemble a horizontally-stacked figure with column titles."""
+def _hstack_with_titles(
+    panels,
+    titles,
+    pad=8,
+    title_h=None,
+    bg=(255, 255, 255),
+    title_scale=0.1,
+):
+    """Assemble a horizontally-stacked figure with column titles.
+
+    `title_h`/font size are auto-scaled by image height by default.
+    """
     try:
         from PIL import ImageDraw, ImageFont
     except ImportError:
@@ -244,6 +271,8 @@ def _hstack_with_titles(panels, titles, pad=8, title_h=28, bg=(255, 255, 255)):
         return np.concatenate(panels, axis=1)
 
     h = max(p.shape[0] for p in panels)
+    if title_h is None:
+        title_h = max(24, int(round(h * title_scale)))
     padded = []
     for p in panels:
         if p.shape[0] != h:
@@ -263,47 +292,104 @@ def _hstack_with_titles(panels, titles, pad=8, title_h=28, bg=(255, 255, 255)):
     img = Image.fromarray(canvas)
     drw = ImageDraw.Draw(img)
     try:
-        font = ImageFont.truetype("/System/Library/Fonts/Supplemental/Arial.ttf", 18)
+        # Prefer Linux default fonts; fallback to PIL's default.
+        font_size = max(12, int(round(title_h * 0.55)))
+        font_candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/System/Library/Fonts/Supplemental/Arial.ttf",
+        ]
+        font = None
+        for fp in font_candidates:
+            try:
+                if os.path.isfile(fp):
+                    font = ImageFont.truetype(fp, font_size)
+                    break
+            except Exception:
+                pass
+        if font is None:
+            raise RuntimeError("no usable truetype font")
     except Exception:
         font = ImageFont.load_default()
     x = 0
     for p, t in zip(padded, titles):
-        drw.text((x + 4, 4), t, fill=(0, 0, 0), font=font)
+        # Vertically center text in the title area.
+        try:
+            bbox = font.getbbox(t)
+            text_h = bbox[3] - bbox[1]
+        except Exception:
+            text_h = 12
+        y = max(0, (title_h - text_h) // 2)
+        drw.text((x + 4, y), t, fill=(0, 0, 0), font=font)
         x += p.shape[1] + pad
     return np.array(img)
 
 
 def vis_compare(
-    scene, baseline_model, ours_model, iteration, view_indices, out_dir="output/vis"
+    scene,
+    baseline_model,
+    ours_model,
+    iteration,
+    view_indices,
+    text_prompt=None,
+    data_dir=None,
+    out_dir="output/vis",
 ):
     os.makedirs(out_dir, exist_ok=True)
+
+    if text_prompt is None:
+        text_prompt = _infer_first_prompt_from_output(baseline_model, iteration)
+    if text_prompt is None:
+        raise RuntimeError(
+            "text_prompt is required (failed to infer from output/*/test/ours_<iter>_text/test_mask/0)"
+        )
+
+    out_dir = os.path.join(out_dir, scene, text_prompt)
+    os.makedirs(out_dir, exist_ok=True)
+
+    if data_dir is None:
+        data_dir = os.path.join("data", "lerf_mask", scene)
+    prompt_png = _prompt_to_png_name(text_prompt)
+
     for vi in view_indices:
         name = f"{vi:05d}.png"
-        paths = {
-            "rgb": Path(baseline_model)
+
+        # Prefer GT RGB (from the dataset) saved by render_lerf_mask.py; fallback to rendered RGB.
+        rgb_gt = (
+            Path(baseline_model)
             / "test"
-            / f"ours_{iteration}"
+            / f"ours_{iteration}_text"
+            / "gt"
+            / name
+        )
+        rgb_render = (
+            Path(baseline_model)
+            / "test"
+            / f"ours_{iteration}_text"
             / "renders"
-            / name,
-            "gt": Path(baseline_model)
-            / "test"
-            / f"ours_{iteration}"
-            / "gt_objects_color"
-            / name,
+            / name
+        )
+        rgb_path = rgb_gt if rgb_gt.exists() else rgb_render
+
+        paths = {
+            "rgb": rgb_path,
+            "gt": Path(data_dir) / "test_mask" / str(vi) / prompt_png,
             "baseline": Path(baseline_model)
             / "test"
-            / f"ours_{iteration}"
-            / "objects_pred"
-            / name,
+            / f"ours_{iteration}_text"
+            / "test_mask"
+            / str(vi)
+            / prompt_png,
             "ours": Path(ours_model)
             / "test"
-            / f"ours_{iteration}"
-            / "objects_pred"
-            / name,
+            / f"ours_{iteration}_text"
+            / "test_mask"
+            / str(vi)
+            / prompt_png,
         }
         missing = [k for k, p in paths.items() if not p.exists()]
         if missing:
-            print(f"[skip] view {vi}: missing {missing}")
+            print(f"[skip] view {vi} prompt={text_prompt}: missing {missing}")
             continue
         rgb = _load_png(paths["rgb"])
         gt = _load_png(paths["gt"])
@@ -311,11 +397,12 @@ def vis_compare(
         ours = _load_png(paths["ours"])
         canvas = _hstack_with_titles(
             [rgb, gt, base, ours],
-            ["RGB", "GT identity", "Baseline (GG)", "Ours (Aniso)"],
+            ["RGB", "GT mask", "Baseline mask", "Ours mask"],
         )
-        out = os.path.join(out_dir, f"vis_compare_{scene}_{vi:05d}.png")
+        safe_prompt = text_prompt.replace(" ", "_")
+        out = os.path.join(out_dir, f"vis_compare_{scene}_{safe_prompt}_{vi:05d}.png")
         Image.fromarray(canvas).save(out)
-        print(f"[vis] compare view {vi} -> {out}")
+        print(f"[vis] compare view {vi} prompt={text_prompt} -> {out}")
 
 
 # =============================================================================
@@ -330,42 +417,72 @@ def vis_ablation(
     ours_model,
     iteration,
     view_indices,
+    text_prompt=None,
+    data_dir=None,
     out_dir="output/vis",
 ):
     os.makedirs(out_dir, exist_ok=True)
+
+    if text_prompt is None:
+        text_prompt = _infer_first_prompt_from_output(baseline_model, iteration)
+    if text_prompt is None:
+        raise RuntimeError(
+            "text_prompt is required (failed to infer from output/*/test/ours_<iter>_text/test_mask/0)"
+        )
+    if data_dir is None:
+        data_dir = os.path.join("data", "lerf_mask", scene)
+    prompt_png = _prompt_to_png_name(text_prompt)
+
     for vi in view_indices:
         name = f"{vi:05d}.png"
 
-        def pred(path):
-            return Path(path) / "test" / f"ours_{iteration}" / "objects_pred" / name
+        # Prefer GT RGB (from the dataset) saved by render_lerf_mask.py; fallback to rendered RGB.
+        rgb_gt = (
+            Path(baseline_model)
+            / "test"
+            / f"ours_{iteration}_text"
+            / "gt"
+            / name
+        )
+        rgb_render = (
+            Path(baseline_model)
+            / "test"
+            / f"ours_{iteration}_text"
+            / "renders"
+            / name
+        )
+        rgb_path = rgb_gt if rgb_gt.exists() else rgb_render
+
+        def pred_mask(model_dir: str):
+            return (
+                Path(model_dir)
+                / "test"
+                / f"ours_{iteration}_text"
+                / "test_mask"
+                / str(vi)
+                / prompt_png
+            )
 
         paths = {
-            "rgb": Path(baseline_model)
-            / "test"
-            / f"ours_{iteration}"
-            / "renders"
-            / name,
-            "baseline": pred(baseline_model),
-            "aniso_only": pred(aniso_only_model),
-            "ours": pred(ours_model),
-            "gt": Path(baseline_model)
-            / "test"
-            / f"ours_{iteration}"
-            / "gt_objects_color"
-            / name,
+            "rgb": rgb_path,
+            "baseline": pred_mask(baseline_model),
+            "aniso_only": pred_mask(aniso_only_model),
+            "ours": pred_mask(ours_model),
+            "gt": Path(data_dir) / "test_mask" / str(vi) / prompt_png,
         }
         missing = [k for k, p in paths.items() if not p.exists()]
         if missing:
-            print(f"[skip] view {vi}: missing {missing}")
+            print(f"[skip] view {vi} prompt={text_prompt}: missing {missing}")
             continue
         imgs = [
             _load_png(paths[k]) for k in ["rgb", "baseline", "aniso_only", "ours", "gt"]
         ]
-        titles = ["RGB", "Baseline", "+Aniso Neighbor", "+Normal Loss (full)", "GT"]
+        titles = ["RGB", "Baseline mask", "+Aniso mask", "+Aniso+Normal mask", "GT mask"]
         canvas = _hstack_with_titles(imgs, titles)
-        out = os.path.join(out_dir, f"vis_ablation_{scene}_{vi:05d}.png")
+        safe_prompt = text_prompt.replace(" ", "_")
+        out = os.path.join(out_dir, f"vis_ablation_{scene}_{safe_prompt}_{vi:05d}.png")
         Image.fromarray(canvas).save(out)
-        print(f"[vis] ablation view {vi} -> {out}")
+        print(f"[vis] ablation view {vi} prompt={text_prompt} -> {out}")
 
 
 # =============================================================================
@@ -463,6 +580,8 @@ def main():
     p_cmp.add_argument("--ours_model", required=True)
     p_cmp.add_argument("--iteration", type=int, default=30000)
     p_cmp.add_argument("--view_indices", type=int, nargs="+", default=[0, 1, 2])
+    p_cmp.add_argument("--text_prompt", default=None)
+    p_cmp.add_argument("--data_dir", default=None)
 
     p_abl = sub.add_parser("ablation")
     p_abl.add_argument("--scene", required=True)
@@ -471,6 +590,8 @@ def main():
     p_abl.add_argument("--ours_model", required=True)
     p_abl.add_argument("--iteration", type=int, default=30000)
     p_abl.add_argument("--view_indices", type=int, nargs="+", default=[0, 1])
+    p_abl.add_argument("--text_prompt", default=None)
+    p_abl.add_argument("--data_dir", default=None)
 
     p_pca = sub.add_parser("pca")
     p_pca.add_argument("--baseline_model", required=True)
@@ -482,22 +603,54 @@ def main():
     if args.cmd == "thin_wall":
         draw_thin_wall()
     elif args.cmd == "compare":
-        vis_compare(
-            args.scene,
-            args.baseline_model,
-            args.ours_model,
-            args.iteration,
-            args.view_indices,
-        )
+        if args.text_prompt is not None:
+            vis_compare(
+                args.scene,
+                args.baseline_model,
+                args.ours_model,
+                args.iteration,
+                args.view_indices,
+                text_prompt=args.text_prompt,
+                data_dir=args.data_dir,
+            )
+        else:
+            # Infer text prompt from baseline model
+            text_prompt_path = Path(args.baseline_model) / "test" / f"ours_{args.iteration}_text" / "test_mask" / "0"
+            for p in sorted(text_prompt_path.glob("*.png")):
+                vis_compare(
+                    args.scene,
+                    args.baseline_model,
+                    args.ours_model,
+                    args.iteration,
+                    args.view_indices,
+                    text_prompt=p.stem,
+                    data_dir=args.data_dir,
+                )
     elif args.cmd == "ablation":
-        vis_ablation(
-            args.scene,
-            args.baseline_model,
-            args.aniso_only_model,
-            args.ours_model,
-            args.iteration,
-            args.view_indices,
-        )
+        if args.text_prompt is not None:
+            vis_ablation(
+                args.scene,
+                args.baseline_model,
+                args.aniso_only_model,
+                args.ours_model,
+                args.iteration,
+                args.view_indices,
+                text_prompt=args.text_prompt,
+                data_dir=args.data_dir,
+            )
+        else:
+            text_prompt_path = Path(args.baseline_model) / "test" / f"ours_{args.iteration}_text" / "test_mask" / "0"
+            for p in sorted(text_prompt_path.glob("*.png")):
+                vis_ablation(
+                    args.scene,
+                    args.baseline_model,
+                    args.aniso_only_model,
+                    args.ours_model,
+                    args.iteration,
+                    args.view_indices,
+                    text_prompt=p.stem,
+                    data_dir=args.data_dir,
+                )
     elif args.cmd == "pca":
         vis_pca(args.baseline_model, args.ours_model, args.iteration)
 
