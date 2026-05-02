@@ -117,10 +117,10 @@ class OptimizationParams(ParamGroup):
         self.use_uncertainty_2d = False
         self.anisotropy_mode = "ratio"  # "ratio" | "fa"
         self.use_anchor_weight = True
-        self.use_neighbor_weight = True
+        self.use_neighbor_weight = False  # safer default — see notes.md §17
         self.entropy_temperature = 1.0
         self.entropy_weight_mode = "entropy"  # "entropy" | "max"
-        self.entropy_min_weight = 0.1
+        self.entropy_min_weight = 0.5  # safer default — see notes.md §17
 
         super().__init__(parser, "Optimization Parameters")
 

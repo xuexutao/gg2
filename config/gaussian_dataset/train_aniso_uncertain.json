@@ -16,8 +16,8 @@
     "use_uncertainty_2d": true,
     "anisotropy_mode": "ratio",
     "use_anchor_weight": true,
-    "use_neighbor_weight": true,
+    "use_neighbor_weight": false,
     "entropy_temperature": 1.0,
     "entropy_weight_mode": "entropy",
-    "entropy_min_weight": 0.1
+    "entropy_min_weight": 0.5
 }

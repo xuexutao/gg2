@@ -345,10 +345,19 @@ def pixel_entropy_weight(logits, temperature=1.0, mode="entropy"):
 
 
 def weighted_2d_ce_loss(
-    cls_criterion, logits, gt_obj, weight_map, num_classes, min_weight=0.1
+    cls_criterion, logits, gt_obj, weight_map, num_classes, min_weight=0.5
 ):
     """
     Uncertainty-weighted 2D cross-entropy for the identity classifier.
+
+    NOTE on `min_weight`: with a large number of classes (e.g. C=256 in LERF-
+    Mask), the entropy of an uninformative softmax is close to log(C) ≈ 5.54,
+    so early in training almost every pixel gets a very low weight and the
+    classifier never learns. We therefore default to `min_weight=0.5` — this
+    still doubles the influence of confident pixels relative to uncertain
+    ones, but every pixel receives at least half the original gradient so
+    training does not starve. If you need a stronger reweighting schedule,
+    raise it gradually from 1.0 to e.g. 0.3 as training progresses.
 
     Args:
         cls_criterion: torch.nn.CrossEntropyLoss(reduction='none')
