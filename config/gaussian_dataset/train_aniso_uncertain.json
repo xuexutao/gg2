@@ -1,0 +1,23 @@
+{
+    "densify_until_iter": 10000,
+    "num_classes": 256,
+    "reg3d_interval": 5,
+    "reg3d_k": 5,
+    "reg3d_lambda_val": 2,
+    "reg3d_max_points": 200000,
+    "reg3d_sample_size": 1000,
+
+    "use_aniso": true,
+    "reg3d_coarse_k": 64,
+    "reg3d_normal_weight": 0.0,
+    "reg3d_normal_only_same_group": true,
+
+    "use_uncertainty_3d": true,
+    "use_uncertainty_2d": true,
+    "anisotropy_mode": "ratio",
+    "use_anchor_weight": true,
+    "use_neighbor_weight": true,
+    "entropy_temperature": 1.0,
+    "entropy_weight_mode": "entropy",
+    "entropy_min_weight": 0.1
+}

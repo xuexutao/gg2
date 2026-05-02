@@ -110,6 +110,18 @@ class OptimizationParams(ParamGroup):
         self.reg3d_normal_weight = 0.0
         self.reg3d_normal_only_same_group = True
 
+        # Breakthrough F: Uncertainty-Aware Grouping
+        # Uses Gaussian anisotropy as a per-Gaussian confidence signal and
+        # softmax entropy as a per-pixel confidence signal.
+        self.use_uncertainty_3d = False
+        self.use_uncertainty_2d = False
+        self.anisotropy_mode = "ratio"  # "ratio" | "fa"
+        self.use_anchor_weight = True
+        self.use_neighbor_weight = True
+        self.entropy_temperature = 1.0
+        self.entropy_weight_mode = "entropy"  # "entropy" | "max"
+        self.entropy_min_weight = 0.1
+
         super().__init__(parser, "Optimization Parameters")
 
 

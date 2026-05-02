@@ -6,6 +6,7 @@
 # Modified from codes in Gaussian-Splatting
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 
+import math
 import torch
 import torch.nn.functional as F
 from torch.autograd import Variable
@@ -250,6 +251,270 @@ def loss_cls_3d_aniso(
             normal_loss = ((1.0 - cos_abs) * same_prob).sum() / (same_prob.sum() + 1e-6)
         else:
             normal_loss = (1.0 - cos_abs).mean()
+
+        total = total + normal_weight * normal_loss
+
+    return total
+
+
+# ============================================================================
+# Uncertainty-Aware Grouping (Breakthrough F)
+# ----------------------------------------------------------------------------
+# Motivation:
+#   The anisotropy of a Gaussian's covariance Σ carries a natural measure of
+#   "how confident should we be about this Gaussian's identity?":
+#     * A very flat Gaussian (λ_min ≪ λ_max) sits on a surface → its normal is
+#       well-defined → nearby Gaussians on the same surface should share its
+#       identity. High confidence.
+#     * A nearly-round Gaussian (λ_min ≈ λ_max) has no preferred direction →
+#       it either sits in a volume (rare in a converged 3DGS) or is a
+#       under-optimized/floating Gaussian. Low confidence.
+#
+# We use this signal in two ways:
+#   (1) downweighting uncertain Gaussians in the 3D neighbor KL term
+#       (implemented below in `loss_cls_3d_aniso_uncertain`);
+#   (2) downweighting pixels whose rendered identity distribution is near-
+#       uniform in the 2D CE loss (implemented in `pixel_entropy_weight`).
+#
+# Both use a *multiplicative* weight in [0, 1], so setting all weights to 1
+# exactly recovers the original loss.
+# ============================================================================
+
+
+def compute_anisotropy(scaling, mode="ratio", eps=1e-8):
+    """
+    Per-Gaussian anisotropy score in [0, 1].
+
+    A flat Gaussian (λ_min ≪ λ_max) → score ~ 1  → confident identity.
+    A spherical Gaussian (λ_min ≈ λ_max) → score ~ 0 → uncertain identity.
+
+    Args:
+        scaling: (N, 3) already-activated scales (pc.get_scaling).
+        mode:
+            "ratio": 1 - λ_min / λ_max  (simple, bounded, most stable)
+            "fa":    fractional anisotropy, 3D generalization of FA used in
+                     diffusion MRI. Sensitive to full spectrum shape.
+    Returns:
+        (N,) tensor with values in [0, 1].
+    """
+    # Note: Gaussian Grouping uses scaling to represent *standard deviations*,
+    # so eigenvalues of Σ are scaling^2. We operate on scaling directly — the
+    # ratio is invariant under squaring.
+    s_max = scaling.max(dim=-1).values
+    s_min = scaling.min(dim=-1).values
+
+    if mode == "ratio":
+        return 1.0 - s_min / (s_max + eps)
+    elif mode == "fa":
+        # Fractional anisotropy: √(3/2) * std(λ) / ||λ||
+        lam = scaling * scaling  # eigenvalues of Σ
+        mean = lam.mean(dim=-1, keepdim=True)
+        var = ((lam - mean) ** 2).mean(dim=-1)
+        norm = (lam * lam).sum(dim=-1)
+        fa = torch.sqrt(1.5 * var / (norm + eps))
+        return torch.clamp(fa, 0.0, 1.0)
+    else:
+        raise ValueError(f"unknown anisotropy mode: {mode}")
+
+
+def pixel_entropy_weight(logits, temperature=1.0, mode="entropy"):
+    """
+    Per-pixel confidence weight computed from the classifier logits over the
+    rendered 2D identity feature. Low entropy (peaky softmax) = confident.
+
+    Args:
+        logits: (C, H, W) classifier output on the rendered identity feature.
+        temperature: softmax temperature; >1 softens, <1 sharpens.
+        mode:
+            "entropy": w = 1 - H(softmax(logits)) / log(C)     ∈ [0, 1]
+            "max":     w = softmax(logits).max(dim=0)          ∈ [1/C, 1]
+    Returns:
+        (H, W) weight tensor, detached from the classifier to avoid degenerate
+        gradients that would push the classifier toward always-confident
+        distributions.
+    """
+    C = logits.shape[0]
+    probs = torch.softmax(logits / max(temperature, 1e-6), dim=0)  # (C, H, W)
+    if mode == "max":
+        w = probs.max(dim=0).values
+    else:  # entropy-based (default)
+        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=0)  # (H, W)
+        w = 1.0 - entropy / math.log(C)
+        w = torch.clamp(w, 0.0, 1.0)
+    return w.detach()
+
+
+def weighted_2d_ce_loss(
+    cls_criterion, logits, gt_obj, weight_map, num_classes, min_weight=0.1
+):
+    """
+    Uncertainty-weighted 2D cross-entropy for the identity classifier.
+
+    Args:
+        cls_criterion: torch.nn.CrossEntropyLoss(reduction='none')
+        logits: (C, H, W) or (N, C, H, W); the classifier output
+        gt_obj: (H, W) long  or (N, H, W) long; GT identity IDs
+        weight_map: (H, W) or (N, H, W) in [0, 1]; per-pixel confidence
+        num_classes: normalization constant (same as original)
+        min_weight: floor on the weight so that *every* pixel still contributes
+                    a little, avoiding total gradient starvation on uncertain
+                    regions.
+
+    Returns:
+        Scalar loss, normalized the same way as the original.
+    """
+    if logits.dim() == 3:
+        logits_b = logits.unsqueeze(0)
+        gt_b = gt_obj.unsqueeze(0)
+    else:
+        logits_b = logits
+        gt_b = gt_obj
+    ce = cls_criterion(logits_b, gt_b)  # (N, H, W) if logits_b was (N, C, H, W)
+    ce = ce.squeeze()  # (H, W) or (N, H, W)
+
+    w = weight_map.squeeze()
+    w = torch.clamp(w, min=min_weight, max=1.0)
+
+    num = (ce * w).sum()
+    den = w.sum().clamp(min=1e-6)
+    loss = num / den
+    return loss / torch.log(torch.tensor(float(num_classes), device=loss.device))
+
+
+def loss_cls_3d_aniso_uncertain(
+    xyz,
+    scaling,
+    rotation,
+    predictions,
+    k=5,
+    lambda_val=2.0,
+    max_points=200000,
+    sample_size=800,
+    coarse_k=64,
+    normal_weight=0.0,
+    normal_only_same_group=True,
+    anisotropy_mode="ratio",
+    use_anchor_weight=True,
+    use_neighbor_weight=True,
+    eps=1e-6,
+):
+    """
+    Uncertainty-aware extension of `loss_cls_3d_aniso`.
+
+    In addition to Anisotropic Affinity (C1) and Normal Consistency (part of
+    C1), this function weights each (anchor, neighbor) KL contribution by the
+    *anisotropy-derived confidence* of the involved Gaussians. The intuition:
+
+        - An anchor that is poorly anisotropic is likely a floater; we should
+          not strongly enforce its neighbors to match its identity distribution.
+        - A neighbor that is poorly anisotropic carries a noisy identity; it
+          should not drag an otherwise-coherent anchor.
+
+    Setting use_anchor_weight=False and use_neighbor_weight=False recovers
+    `loss_cls_3d_aniso` exactly (a useful baseline).
+
+    Extra args vs. `loss_cls_3d_aniso`:
+        anisotropy_mode: "ratio" | "fa"
+        use_anchor_weight:   whether to multiply by anisotropy(anchor)
+        use_neighbor_weight: whether to multiply by anisotropy(neighbor)
+    """
+    device = xyz.device
+    N_total = xyz.shape[0]
+
+    # --- Step 1: optional down-sample over all Gaussians ---
+    if N_total > max_points:
+        perm = torch.randperm(N_total, device=device)[:max_points]
+        xyz = xyz[perm]
+        scaling = scaling[perm]
+        rotation = rotation[perm]
+        predictions = predictions[perm]
+
+    N = xyz.shape[0]
+
+    # --- Pre-compute per-Gaussian anisotropy weight ---
+    aniso_w = compute_anisotropy(scaling, mode=anisotropy_mode)  # (N,) in [0,1]
+
+    # --- Step 2: anchors ---
+    idx_anchor = torch.randperm(N, device=device)[:sample_size]
+    xyz_a = xyz[idx_anchor]
+    scl_a = scaling[idx_anchor]
+    rot_a = rotation[idx_anchor]
+    pred_a = predictions[idx_anchor]
+    w_a = aniso_w[idx_anchor]  # (M,)
+
+    # --- Step 3a: cheap coarse Euclidean KNN ---
+    with torch.no_grad():
+        dists_eu = torch.cdist(xyz_a, xyz)
+        coarse_k_eff = min(coarse_k, N)
+        _, coarse_idx = dists_eu.topk(coarse_k_eff, largest=False)
+
+    # --- Step 3b: Mahalanobis re-ranking among the coarse candidates ---
+    cov_a = _build_covariance(scl_a, rot_a)  # (M, 3, 3)
+
+    scl_cand = scaling[coarse_idx]  # (M, Ck, 3)
+    rot_cand = rotation[coarse_idx]
+    xyz_cand = xyz[coarse_idx]
+
+    M = sample_size if sample_size <= N else N
+    Ck = coarse_k_eff
+
+    R_cand = _quat_to_rotmat(rot_cand.reshape(-1, 4)).reshape(M, Ck, 3, 3)
+    S_cand = torch.diag_embed((scl_cand * scl_cand))
+    cov_cand = R_cand @ S_cand @ R_cand.transpose(-1, -2)
+
+    delta = xyz_a.unsqueeze(1) - xyz_cand
+    I3 = torch.eye(3, device=device, dtype=xyz_a.dtype)
+    cov_a_inv = torch.linalg.inv(cov_a + eps * I3)
+    cov_cand_inv = torch.linalg.inv(cov_cand + eps * I3)
+
+    term_a = torch.einsum("mcd,mde,mce->mc", delta, cov_a_inv, delta)
+    term_b = torch.einsum("mcd,mcde,mce->mc", delta, cov_cand_inv, delta)
+    d_maha = torch.sqrt(torch.clamp(0.5 * (term_a + term_b), min=0.0) + eps)
+
+    k_eff = min(k, Ck)
+    _, topk_in_coarse = d_maha.topk(k_eff, largest=False)
+    row_idx = torch.arange(M, device=device).unsqueeze(1).expand(-1, k_eff)
+    neighbor_indices = coarse_idx[row_idx, topk_in_coarse]
+
+    neighbor_preds = predictions[neighbor_indices]  # (M, k, C)
+    w_nb = aniso_w[neighbor_indices]  # (M, k)
+
+    # --- Step 4: weighted KL divergence ---
+    # KL(p_anchor || p_neighbor), reshape to (M, k)
+    kl_per_pair = (
+        pred_a.unsqueeze(1)
+        * (torch.log(pred_a.unsqueeze(1) + 1e-10) - torch.log(neighbor_preds + 1e-10))
+    ).sum(dim=-1)  # (M, k)
+
+    # Build per-pair confidence weight, floored so no pair has zero weight.
+    pair_w = torch.ones_like(kl_per_pair)
+    if use_anchor_weight:
+        pair_w = pair_w * w_a.unsqueeze(1)
+    if use_neighbor_weight:
+        pair_w = pair_w * w_nb
+    pair_w = torch.clamp(pair_w, min=0.05, max=1.0).detach()
+
+    num = (kl_per_pair * pair_w).sum()
+    den = pair_w.sum().clamp(min=1e-6)
+    kl_loss = num / den
+    num_classes = predictions.size(1)
+    kl_loss = kl_loss / num_classes
+
+    total = lambda_val * kl_loss
+
+    # --- Step 5: Normal Consistency (weighted) ---
+    if normal_weight > 0.0:
+        normals = gaussian_normals(scaling, rotation)
+        n_a = normals[idx_anchor]
+        n_nb = normals[neighbor_indices]
+        cos_abs = torch.abs((n_a.unsqueeze(1) * n_nb).sum(dim=-1))  # (M, k)
+
+        if normal_only_same_group:
+            same_prob = (pred_a.unsqueeze(1) * neighbor_preds).sum(dim=-1)
+            w_combo = same_prob * pair_w
+            normal_loss = ((1.0 - cos_abs) * w_combo).sum() / (w_combo.sum() + 1e-6)
+        else:
+            normal_loss = ((1.0 - cos_abs) * pair_w).sum() / (pair_w.sum() + 1e-6)
 
         total = total + normal_weight * normal_loss
 
