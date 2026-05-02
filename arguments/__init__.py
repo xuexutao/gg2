@@ -3,18 +3,20 @@
 # All rights reserved.
 #
 # ------------------------------------------------------------------------
-# Modified from codes in Gaussian-Splatting 
+# Modified from codes in Gaussian-Splatting
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 
 from argparse import ArgumentParser, Namespace
 import sys
 import os
 
+
 class GroupParams:
     pass
 
+
 class ParamGroup:
-    def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
+    def __init__(self, parser: ArgumentParser, name: str, fill_none=False):
         group = parser.add_argument_group(name)
         for key, value in vars(self).items():
             shorthand = False
@@ -22,12 +24,16 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
+            value = value if not fill_none else None
             if shorthand:
                 if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
+                    group.add_argument(
+                        "--" + key, ("-" + key[0:1]), default=value, action="store_true"
+                    )
                 else:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
+                    group.add_argument(
+                        "--" + key, ("-" + key[0:1]), default=value, type=t
+                    )
             else:
                 if t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
@@ -41,7 +47,8 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
-class ModelParams(ParamGroup): 
+
+class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
@@ -51,7 +58,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
-        self.n_views = 100 
+        self.n_views = 100
         self.random_init = False
         self.train_split = False
         self._object_path = "object_mask"
@@ -63,12 +70,14 @@ class ModelParams(ParamGroup):
         g.source_path = os.path.abspath(g.source_path)
         return g
 
+
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
+
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
@@ -95,9 +104,16 @@ class OptimizationParams(ParamGroup):
         self.reg3d_max_points = 300000
         self.reg3d_sample_size = 1000
 
+        # Breakthrough 1: Anisotropic Affinity (default off = original Gaussian Grouping)
+        self.use_aniso = False
+        self.reg3d_coarse_k = 64
+        self.reg3d_normal_weight = 0.0
+        self.reg3d_normal_only_same_group = True
+
         super().__init__(parser, "Optimization Parameters")
 
-def get_combined_args(parser : ArgumentParser):
+
+def get_combined_args(parser: ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
@@ -114,7 +130,7 @@ def get_combined_args(parser : ArgumentParser):
     args_cfgfile = eval(cfgfile_string)
 
     merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
+    for k, v in vars(args_cmdline).items():
         if v != None:
             merged_dict[k] = v
     return Namespace(**merged_dict)
