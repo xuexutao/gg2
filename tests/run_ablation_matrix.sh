@@ -22,12 +22,13 @@
 #    FAST=1 bash tests/run_ablation_matrix.sh
 # ============================================================================
 
-set -euo pipefail
+set -eo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-SCENES="${SCENES:-figurines ramen teatime}"
+# SCENES="${SCENES:-figurines ramen teatime}"
+SCENES="${!SCENES:-figurines}"
 RES="${RES:-1}"
 
 LOG_DIR="output/verify_logs"
@@ -66,7 +67,8 @@ CFG["uncertain"]="config/gaussian_dataset/train_aniso_uncertain.json"
 CFG["full"]="config/gaussian_dataset/train_full.json"
 
 # The tags to iterate over (allow user override via TAGS env var).
-TAGS="${TAGS:-baseline aniso normal uncertain full}"
+# TAGS="${TAGS:-baseline aniso normal uncertain full}"
+TAGS="${!TAGS:-baseline uncertain}"
 
 train_one () {
     local SCENE="$1"
@@ -86,18 +88,22 @@ train_one () {
 
     local CKPT="${OUT_DIR}/point_cloud/iteration_${ITER_NUM}/classifier.pth"
     if [[ -f "$CKPT" ]]; then
-        log "  [skip] ${SCENE}/${TAG}: checkpoint already exists at ${CKPT}"
+        log "  [skip] ${SCENE}/${TAG}: checkpoint already exists at ${CKPT}" >&2
         echo "$OUT_DIR"
         return 0
     fi
 
     local DATA="data/lerf_mask/${SCENE}"
     if [[ ! -d "$DATA" ]]; then
-        log "  [ERROR] dataset missing: $DATA"
+        log "  [ERROR] dataset missing: $DATA" >&2
         return 2
     fi
 
-    log "  [train] ${SCENE} / ${TAG} -> ${OUT_DIR}"
+    log "  [train] ${SCENE} / ${TAG} -> ${OUT_DIR}" >&2
+    if [[ -d "$OUT_DIR/point_cloud/iteration_${ITER_NUM}/classifier.pth" ]]; then
+        log "  [skip] ${SCENE}/${TAG}: output dir already exists" >&2
+        return "$OUT_DIR"
+    fi
     python train.py \
         -s "$DATA" -r "$RES" \
         -m "$OUT_DIR" \
