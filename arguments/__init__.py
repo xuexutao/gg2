@@ -104,23 +104,11 @@ class OptimizationParams(ParamGroup):
         self.reg3d_max_points = 300000
         self.reg3d_sample_size = 1000
 
-        # Breakthrough 1: Anisotropic Affinity (default off = original Gaussian Grouping)
+        # Anisotropic Affinity (our core contribution, default off = original Gaussian Grouping)
         self.use_aniso = False
         self.reg3d_coarse_k = 64
         self.reg3d_normal_weight = 0.0
         self.reg3d_normal_only_same_group = True
-
-        # Breakthrough F: Uncertainty-Aware Grouping
-        # Uses Gaussian anisotropy as a per-Gaussian confidence signal and
-        # softmax entropy as a per-pixel confidence signal.
-        self.use_uncertainty_3d = False
-        self.use_uncertainty_2d = False
-        self.anisotropy_mode = "ratio"  # "ratio" | "fa"
-        self.use_anchor_weight = True
-        self.use_neighbor_weight = False  # safer default — see notes.md §17
-        self.entropy_temperature = 1.0
-        self.entropy_weight_mode = "entropy"  # "entropy" | "max"
-        self.entropy_min_weight = 0.5  # safer default — see notes.md §17
 
         super().__init__(parser, "Optimization Parameters")
 

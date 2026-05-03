@@ -48,23 +48,29 @@ fi
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
 
 log "============================================================="
-log "Ablation matrix: ${#SCENES[@]} scenes x 5 configs (+F additions)"
+log "Ablation matrix: scenes x configs (+F additions)"
 log "Scenes   : $SCENES"
 log "Log file : $LOG_FILE"
 log "============================================================="
 
-# Configs keyed by short tag. The order here defines the ablation columns.
-#   baseline   : original Gaussian Grouping (Euclidean KNN, no extras)
-#   aniso      : + Anisotropic neighbors (C1.a)
-#   normal     : + Normal consistency loss (C1.b) [a.k.a. old "full"]
-#   uncertain  : + Uncertainty-Aware grouping (F)     [no normal loss]
-#   full       : + Aniso + Normal + Uncertainty       [final]
-declare -A CFG
-CFG["baseline"]="config/gaussian_dataset/train.json"
-CFG["aniso"]="config/gaussian_dataset/train_aniso_only.json"
-CFG["normal"]="config/gaussian_dataset/train_aniso.json"
-CFG["uncertain"]="config/gaussian_dataset/train_aniso_uncertain.json"
-CFG["full"]="config/gaussian_dataset/train_full.json"
+config_for_tag () {
+    # Bash 3.2 on macOS doesn't support associative arrays.
+    # Keep this mapping in a portable case statement.
+    local TAG="$1"
+    case "$TAG" in
+        baseline)   echo "config/gaussian_dataset/train.json" ;;
+        aniso)      echo "config/gaussian_dataset/train_aniso_only.json" ;;
+        normal)     echo "config/gaussian_dataset/train_aniso.json" ;;
+        uncertain)  echo "config/gaussian_dataset/train_aniso_uncertain.json" ;;
+        uncertain2d) echo "config/gaussian_dataset/train_aniso_uncertain2d.json" ;;
+        uncertain3d) echo "config/gaussian_dataset/train_aniso_uncertain3d.json" ;;
+        full)       echo "config/gaussian_dataset/train_full.json" ;;
+        *)
+            echo ""
+            return 1
+            ;;
+    esac
+}
 
 # The tags to iterate over (allow user override via TAGS env var).
 # TAGS="${TAGS:-baseline aniso normal uncertain full}"
@@ -73,7 +79,12 @@ TAGS="${!TAGS:-baseline uncertain}"
 train_one () {
     local SCENE="$1"
     local TAG="$2"
-    local CONFIG="${CFG[$TAG]}"
+    local CONFIG
+    CONFIG="$(config_for_tag "$TAG")" || true
+    if [[ -z "$CONFIG" ]]; then
+        log "  [ERROR] unknown TAG '${TAG}'. Known: baseline aniso normal uncertain uncertain2d uncertain3d full"
+        return 2
+    fi
     local OUT_DIR="output/verify_${SCENE}_${TAG}"
 
     # Backward-compat: the old 'baseline' dir was named _baseline; reuse it.
@@ -137,19 +148,22 @@ FIRST=1
 for SCENE in $SCENES; do
     log ""
     log "=== Scene: $SCENE ==="
-    declare -A MODEL_DIRS
+    # Store per-tag output dirs in variables: MODEL_DIR_<tag>
     for TAG in $TAGS; do
-        MODEL_DIRS[$TAG]=$(train_one "$SCENE" "$TAG") || true
-        render_one "${MODEL_DIRS[$TAG]}" || true
+        OUT_DIR=$(train_one "$SCENE" "$TAG") || true
+        eval "MODEL_DIR_${TAG}=\"${OUT_DIR}\""
+        render_one "${OUT_DIR}" || true
     done
 
     log "  [eval] ${SCENE} (comparing ${TAGS} configs)"
     # Evaluate each model individually against the baseline
     for TAG in $TAGS; do
+        BASELINE_DIR=$(eval echo "\$MODEL_DIR_baseline")
+        OURS_DIR=$(eval echo "\$MODEL_DIR_${TAG}")
         python tests/eval_compare.py \
             --scene "$SCENE" \
-            --baseline_model "${MODEL_DIRS[baseline]}" \
-            --ours_model     "${MODEL_DIRS[$TAG]}" \
+            --baseline_model "${BASELINE_DIR}" \
+            --ours_model     "${OURS_DIR}" \
             --iteration      "$ITER_NUM" \
             --out_json       "${LOG_DIR}/metrics_${SCENE}_${TAG}_${TS}.json" \
             2>&1 | tee -a "$LOG_FILE" >/dev/null
