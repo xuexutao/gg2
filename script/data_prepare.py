@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""
+Data preparation script for Gaussian Grouping.
+
+Input: A directory with only `images/` and `sparse/0/`
+Output: A structure like `figurines/` with:
+  - images/        (original, kept as-is)
+  - images_train/  (training images, excludes test views)
+  - object_mask/   (per-image instance segmentation from SAM Automatic Mask Generator)
+  - test_mask/     (test views with text-prompt class masks from Grounded-SAM)
+  - distorted/     (copy of sparse/, for MVS compatibility)
+
+Usage:
+  # Only directory structure
+  python script/data_prepare.py --source_path data/my_scene \
+    --num_test_views 4 --skip_sam
+
+  # With object_mask (SAM Automatic)
+  python script/data_prepare.py -s data/my_scene \
+    --sam_checkpoint path/to/sam_vit_h_4b8939.pth
+
+  # With object_mask + test_mask (Grounded-SAM with text prompts)
+  python script/data_prepare.py -s data/my_scene \
+    --sam_checkpoint path/to/sam_vit_h_4b8939.pth \
+    --groundingdino_config path/to/GroundingDINO_SwinT_OGC.py \
+    --groundingdino_checkpoint path/to/groundingdino_swint_ogc.pth \
+    --text_prompts "green apple. red apple. toy chair. duck."
+
+Text prompt format:
+  - Separate classes with '. ' or use --text_prompts multiple times
+  - e.g., "green apple. red apple"  OR  --text_prompts "green apple" --text_prompts "red apple"
+"""
+
+import os
+import sys
+import argparse
+import shutil
+from os import makedirs, path
+from pathlib import Path
+from typing import List, Optional, Tuple
+import numpy as np
+from PIL import Image
+import torch
+from tqdm import tqdm
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Data preparation for Gaussian Grouping"
+    )
+    parser.add_argument(
+        "--source_path",
+        "-s",
+        required=True,
+        help="Path to source directory containing images/ and sparse/",
+    )
+    parser.add_argument(
+        "--num_test_views",
+        "-n",
+        type=int,
+        default=4,
+        help="Number of test views to reserve (default: 4)",
+    )
+    parser.add_argument(
+        "--sam_checkpoint",
+        type=str,
+        default=None,
+        help="Path to SAM checkpoint (e.g., sam_vit_h_4b8939.pth)",
+    )
+    parser.add_argument(
+        "--sam_model_type",
+        type=str,
+        default="vit_h",
+        help="SAM model type: vit_h, vit_l, vit_b (default: vit_h)",
+    )
+    parser.add_argument(
+        "--groundingdino_config",
+        type=str,
+        default=None,
+        help="Path to GroundingDINO config (e.g., GroundingDINO_SwinT_OGC.py)",
+    )
+    parser.add_argument(
+        "--groundingdino_checkpoint",
+        type=str,
+        default=None,
+        help="Path to GroundingDINO checkpoint (e.g., groundingdino_swint_ogc.pth)",
+    )
+    parser.add_argument(
+        "--text_prompts",
+        type=str,
+        nargs="+",
+        default=[],
+        help='Text prompts for Grounded-SAM, e.g., "green apple. red apple. duck"',
+    )
+    parser.add_argument(
+        "--box_threshold",
+        type=float,
+        default=0.3,
+        help="Box threshold for GroundingDINO (default: 0.3)",
+    )
+    parser.add_argument(
+        "--text_threshold",
+        type=float,
+        default=0.45,
+        help="Text threshold for GroundingDINO (default: 0.45)",
+    )
+    parser.add_argument(
+        "--skip_sam",
+        action="store_true",
+        help="Skip SAM segmentation (only create directory structure)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device for SAM: cuda or cpu (default: cuda)",
+    )
+    return parser.parse_args()
+
+
+def parse_text_prompts(prompts_list: List[str]) -> List[str]:
+    """
+    Parse text prompts from command line.
+    Handles:
+      - --text_prompts "green apple. red apple. duck"
+      - --text_prompts "green apple" --text_prompts "red apple"
+    """
+    all_prompts = []
+    for item in prompts_list:
+        for part in item.split("."):
+            part = part.strip()
+            if part:
+                all_prompts.append(part)
+    return all_prompts
+
+
+def get_image_files(images_dir: str) -> List[str]:
+    """Get sorted list of image files in images/ directory."""
+    exts = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+    files = []
+    for f in sorted(os.listdir(images_dir)):
+        if Path(f).suffix in exts:
+            files.append(f)
+    return files
+
+
+def split_train_test(
+    image_files: List[str], num_test: int
+) -> Tuple[List[str], List[str]]:
+    """
+    Split images into train and test.
+    Test views = last N images (like typical NeRF/Gaussian-Splatting practice).
+    """
+    if num_test <= 0:
+        return image_files, []
+    if num_test >= len(image_files):
+        print(f"Warning: num_test_views={num_test} >= total images={len(image_files)}")
+        return [], image_files
+    train_files = image_files[:-num_test]
+    test_files = image_files[-num_test:]
+    return train_files, test_files
+
+
+def create_images_train(
+    source_path: str, train_files: List[str], test_files: List[str]
+):
+    """
+    Create images_train/ directory (copy training images).
+    Also: copy test images with test_0.jpg naming if not already present.
+    """
+    images_dir = path.join(source_path, "images")
+    images_train_dir = path.join(source_path, "images_train")
+    makedirs(images_train_dir, exist_ok=True)
+
+    for fname in train_files:
+        src = path.join(images_dir, fname)
+        dst = path.join(images_train_dir, fname)
+        if not path.exists(dst):
+            shutil.copy2(src, dst)
+
+    for i, fname in enumerate(test_files):
+        src = path.join(images_dir, fname)
+        dst_test_name = path.join(images_dir, f"test_{i}.jpg")
+        if not path.exists(dst_test_name):
+            img = Image.open(src).convert("RGB")
+            img.save(dst_test_name, quality=95)
+
+
+def create_distorted(source_path: str):
+    """Create distorted/ directory by copying sparse/ contents."""
+    sparse_dir = path.join(source_path, "sparse")
+    distorted_dir = path.join(source_path, "distorted")
+    distorted_sparse_dir = path.join(distorted_dir, "sparse")
+
+    if not path.exists(sparse_dir):
+        print(f"Warning: sparse/ not found at {sparse_dir}, skipping distorted/")
+        return
+
+    if path.exists(distorted_sparse_dir):
+        print(f"distorted/sparse/ already exists, skipping copy")
+        return
+
+    makedirs(distorted_dir, exist_ok=True)
+    shutil.copytree(sparse_dir, distorted_sparse_dir)
+    print(f"Copied sparse/ -> distorted/sparse/")
+
+
+def create_test_mask_dirs(source_path: str, test_files: List[str]):
+    """
+    Create test_mask/0/, test_mask/1/ ... directories.
+    """
+    test_mask_dir = path.join(source_path, "test_mask")
+    makedirs(test_mask_dir, exist_ok=True)
+
+    for i in range(len(test_files)):
+        view_dir = path.join(test_mask_dir, str(i))
+        makedirs(view_dir, exist_ok=True)
+
+
+def run_sam_segmentation(
+    source_path: str,
+    image_files: List[str],
+    sam_checkpoint: str,
+    sam_model_type: str,
+    device: str = "cuda",
+):
+    """
+    Run SAM Automatic Mask Generator on all images.
+    Output: object_mask/<image_name>.png
+        - 0 = background
+        - 1,2,3... = instance IDs (sorted roughly by area)
+    """
+    from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
+
+    images_dir = path.join(source_path, "images")
+    object_mask_dir = path.join(source_path, "object_mask")
+    makedirs(object_mask_dir, exist_ok=True)
+
+    print(f"Loading SAM {sam_model_type} from {sam_checkpoint} ...")
+    sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
+    sam.to(device=device)
+
+    mask_generator = SamAutomaticMaskGenerator(
+        model=sam,
+        points_per_side=32,
+        pred_iou_thresh=0.86,
+        stability_score_thresh=0.92,
+        crop_n_layers=1,
+        crop_n_points_downscale_factor=2,
+        min_mask_region_area=100,
+    )
+
+    print(f"Generating object_mask for {len(image_files)} images ...")
+    for fname in tqdm(image_files):
+        img_path = path.join(images_dir, fname)
+        base_name = Path(fname).stem
+        mask_path = path.join(object_mask_dir, f"{base_name}.png")
+
+        if path.exists(mask_path):
+            continue
+
+        img = Image.open(img_path).convert("RGB")
+        img_np = np.array(img)
+
+        masks = mask_generator.generate(img_np)
+
+        if len(masks) == 0:
+            seg = np.zeros(img_np.shape[:2], dtype=np.uint8)
+        else:
+            sorted_masks = sorted(masks, key=lambda x: x["area"], reverse=True)
+            seg = np.zeros(img_np.shape[:2], dtype=np.int32)
+            for idx, m in enumerate(sorted_masks):
+                seg[m["segmentation"]] = idx + 1
+            seg = seg.astype(np.uint8)
+
+        Image.fromarray(seg).save(mask_path)
+
+    print(f"SAM segmentation done. object_mask/ at {object_mask_dir}")
+
+
+def run_grounded_sam_test_mask(
+    source_path: str,
+    test_files: List[str],
+    text_prompts: List[str],
+    sam_checkpoint: str,
+    sam_model_type: str,
+    groundingdino_config: str,
+    groundingdino_checkpoint: str,
+    box_threshold: float = 0.3,
+    text_threshold: float = 0.45,
+    device: str = "cuda",
+):
+    """
+    Run Grounded-SAM on test views to generate text-prompt class masks.
+
+    For each test view and each text prompt:
+      - Run GroundingDINO to detect boxes
+      - Run SAM to get segmentation mask
+      - Save as: test_mask/<view_idx>/<class_name>.png
+
+    Output format (same as eval_lerf_mask.py expects):
+      - 0 = background, 255 = foreground (grayscale PNG)
+    """
+    from segment_anything import sam_model_registry, SamPredictor
+    from ext.grounded_sam import load_model_local, grouned_sam_output
+
+    images_dir = path.join(source_path, "images")
+    test_mask_dir = path.join(source_path, "test_mask")
+    makedirs(test_mask_dir, exist_ok=True)
+    for i in range(len(test_files)):
+        makedirs(path.join(test_mask_dir, str(i)), exist_ok=True)
+
+    print("=" * 70)
+    print("Loading models for Grounded-SAM...")
+    print(f"  SAM: {sam_checkpoint}")
+    print(f"  GroundingDINO config: {groundingdino_config}")
+    print(f"  GroundingDINO checkpoint: {groundingdino_checkpoint}")
+    print(f"  Text prompts: {text_prompts}")
+    print("=" * 70)
+
+    print("Loading SAM...")
+    sam = sam_model_registry[sam_model_type](checkpoint=sam_checkpoint)
+    sam.to(device=device)
+    sam_predictor = SamPredictor(sam)
+
+    print("Loading GroundingDINO...")
+    groundingdino_model = load_model_local(
+        groundingdino_config, groundingdino_checkpoint, device=device
+    )
+
+    print(
+        f"Generating test_mask for {len(test_files)} views x {len(text_prompts)} classes ..."
+    )
+
+    for view_idx, fname in enumerate(tqdm(test_files, desc="Test views")):
+        img_path = path.join(images_dir, fname)
+        view_dir = path.join(test_mask_dir, str(view_idx))
+
+        img = Image.open(img_path).convert("RGB")
+        img_np = np.array(img)
+
+        for prompt in text_prompts:
+            safe_name = prompt.strip()
+            mask_path = path.join(view_dir, f"{safe_name}.png")
+
+            if path.exists(mask_path):
+                continue
+
+            try:
+                mask_bool, _ = grouned_sam_output(
+                    groundingdino_model,
+                    sam_predictor,
+                    prompt,
+                    img_np,
+                    BOX_TRESHOLD=box_threshold,
+                    TEXT_TRESHOLD=text_threshold,
+                    device=device,
+                )
+
+                mask_uint8 = (mask_bool.cpu().numpy().astype(np.uint8)) * 255
+                Image.fromarray(mask_uint8).save(mask_path)
+            except Exception as e:
+                print(f"  Warning: failed for view={view_idx}, prompt='{prompt}': {e}")
+                empty_mask = np.zeros(img_np.shape[:2], dtype=np.uint8)
+                Image.fromarray(empty_mask).save(mask_path)
+
+    print(f"Grounded-SAM done. test_mask/ at {test_mask_dir}")
+
+
+def main():
+    args = parse_args()
+    source_path = args.source_path
+
+    images_dir = path.join(source_path, "images")
+    sparse_dir = path.join(source_path, "sparse")
+
+    if not path.exists(images_dir) or not path.exists(sparse_dir):
+        print(f"Error: expected images/ and sparse/ in {source_path}")
+        sys.exit(1)
+
+    image_files = get_image_files(images_dir)
+    if len(image_files) == 0:
+        print(f"Error: no images found in {images_dir}")
+        sys.exit(1)
+
+    print(f"Found {len(image_files)} images in {images_dir}")
+
+    train_files, test_files = split_train_test(image_files, args.num_test_views)
+    print(f"Train: {len(train_files)}, Test: {len(test_files)}")
+    if len(test_files) > 0:
+        print(f"  Test views (last N): {test_files[:3]} ... {test_files[-1:]}")
+
+    text_prompts = parse_text_prompts(args.text_prompts)
+    if text_prompts:
+        print(f"Text prompts: {text_prompts}")
+
+    create_images_train(source_path, train_files, test_files)
+    print("images_train/ created")
+
+    create_distorted(source_path)
+
+    create_test_mask_dirs(source_path, test_files)
+
+    need_sam = (
+        not args.skip_sam and args.sam_checkpoint and path.exists(args.sam_checkpoint)
+    )
+    need_grounded_sam = (
+        need_sam
+        and text_prompts
+        and args.groundingdino_config
+        and path.exists(args.groundingdino_config)
+        and args.groundingdino_checkpoint
+        and path.exists(args.groundingdino_checkpoint)
+    )
+
+    if args.skip_sam:
+        print("--skip_sam set, skipping all SAM segmentation")
+        object_mask_dir = path.join(source_path, "object_mask")
+        makedirs(object_mask_dir, exist_ok=True)
+    else:
+        if not args.sam_checkpoint or not path.exists(args.sam_checkpoint):
+            print("")
+            print("=" * 70)
+            print("SAM checkpoint not provided or not found.")
+            print("")
+            print("To generate object_mask/, provide:")
+            print("  --sam_checkpoint /path/to/sam_vit_h_4b8939.pth")
+            print("")
+            if text_prompts:
+                print(
+                    "To also generate test_mask/ with Grounded-SAM, additionally provide:"
+                )
+                print("  --groundingdino_config /path/to/GroundingDINO_SwinT_OGC.py")
+                print(
+                    "  --groundingdino_checkpoint /path/to/groundingdino_swint_ogc.pth"
+                )
+                print(f'  --text_prompts "{". ".join(text_prompts)}"')
+            print("")
+            print("You can download SAM checkpoints from:")
+            print(
+                "  https://github.com/facebookresearch/segment-anything#model-checkpoints"
+            )
+            print("")
+            print(
+                "Alternatively, run with --skip_sam to only create directory structure."
+            )
+            print("=" * 70)
+            print("")
+            object_mask_dir = path.join(source_path, "object_mask")
+            makedirs(object_mask_dir, exist_ok=True)
+        else:
+            all_images_for_sam = image_files.copy()
+            for i in range(len(test_files)):
+                extra_test_name = f"test_{i}.jpg"
+                if path.exists(path.join(images_dir, extra_test_name)):
+                    all_images_for_sam.append(extra_test_name)
+            run_sam_segmentation(
+                source_path,
+                all_images_for_sam,
+                args.sam_checkpoint,
+                args.sam_model_type,
+                args.device,
+            )
+
+            if need_grounded_sam:
+                run_grounded_sam_test_mask(
+                    source_path,
+                    test_files,
+                    text_prompts,
+                    args.sam_checkpoint,
+                    args.sam_model_type,
+                    args.groundingdino_config,
+                    args.groundingdino_checkpoint,
+                    args.box_threshold,
+                    args.text_threshold,
+                    args.device,
+                )
+            else:
+                if text_prompts:
+                    print("")
+                    print("=" * 70)
+                    print("Text prompts provided but GroundingDINO not ready.")
+                    print("test_mask/ was NOT auto-generated.")
+                    print("")
+                    print("To auto-generate test_mask/, provide:")
+                    print(
+                        "  --groundingdino_config /path/to/GroundingDINO_SwinT_OGC.py"
+                    )
+                    print(
+                        "  --groundingdino_checkpoint /path/to/groundingdino_swint_ogc.pth"
+                    )
+                    print("=" * 70)
+                    print("")
+
+    print("")
+    print("=" * 70)
+    print("Data preparation done.")
+    print("")
+    print("Created/verified:")
+    print(f"  images/          -> {len(image_files)} original images")
+    print(f"  images_train/    -> {len(train_files)} training images")
+    print(f"  object_mask/     -> per-image instance segmentation")
+    if need_grounded_sam and text_prompts:
+        print(
+            f"  test_mask/       -> {len(test_files)} views x {len(text_prompts)} classes (auto-generated)"
+        )
+    else:
+        print(f"  test_mask/       -> {len(test_files)} view dirs (placeholders)")
+    print(f"  distorted/       -> copy of sparse/ for MVS compatibility")
+    print("")
+    if not need_grounded_sam and len(test_files) > 0:
+        print("If test_mask/ is not auto-generated, you need to:")
+        print("  Put class-wise GT masks like:")
+        print("    test_mask/0/green apple.png")
+        print("    test_mask/0/red apple.png")
+        print("    ...")
+        print("  (0=background, 255=foreground, grayscale PNG)")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
