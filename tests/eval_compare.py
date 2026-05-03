@@ -99,22 +99,28 @@ def evaluate_model(scene, model_dir, iteration):
         print(f"[ERROR] Pred dir missing: {pred_root}")
         return None
 
+    # GT view dirs are named by view index, e.g., "0", "2" (not all test views have GT)
+    # Pred view dirs are named by rendering index, e.g., "0", "1", "2", ..., "22" (all test views)
+    # Match by directory NAME, not by position!
     gt_view_dirs = sorted([d for d in gt_root.iterdir() if d.is_dir()])
-    pred_view_dirs = sorted([d for d in pred_root.iterdir() if d.is_dir()])
+    pred_view_dirs = {d.name: d for d in pred_root.iterdir() if d.is_dir()}
 
-    # The pred view dirs are named by rendering index (0, 1, 2, ...).
-    # The GT view dirs are named by view image name.
-    # We match by sorted order.
-    if len(gt_view_dirs) != len(pred_view_dirs):
-        print(
-            f"[WARN] Number of test views differ — gt={len(gt_view_dirs)} "
-            f"pred={len(pred_view_dirs)}. Using min overlap positionally."
-        )
+    print(f"[DEBUG] GT views: {[d.name for d in gt_view_dirs]}")
+    print(f"[DEBUG] Pred views available: {sorted(pred_view_dirs.keys())[:10]}...")
 
     per_class_iou = {}
     per_class_biou = {}
 
-    for gt_view_dir, pred_view_dir in zip(gt_view_dirs, pred_view_dirs):
+    for gt_view_dir in gt_view_dirs:
+        view_idx = gt_view_dir.name
+
+        if view_idx not in pred_view_dirs:
+            print(f"[WARN] GT view {view_idx} not found in pred, skipping")
+            continue
+
+        pred_view_dir = pred_view_dirs[view_idx]
+        print(f"[DEBUG] Matching GT view {view_idx} → Pred view {view_idx}")
+
         for cat_file in os.listdir(gt_view_dir):
             if not cat_file.endswith(".png"):
                 continue
@@ -123,7 +129,6 @@ def evaluate_model(scene, model_dir, iteration):
             pred_path = pred_view_dir / cat_file
 
             if not pred_path.exists():
-                # prediction missing for this class/view — count as 0
                 per_class_iou.setdefault(cat_id, []).append(0.0)
                 per_class_biou.setdefault(cat_id, []).append(0.0)
                 continue
