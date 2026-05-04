@@ -66,7 +66,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             pred_obj_mask = pred_obj_mask.any(dim=0)
             pred_obj_mask = (pred_obj_mask.squeeze().cpu().numpy() * 255).astype(np.uint8)
         else:
-            pred_obj_mask = torch.zeros_like(view.objects).cpu().numpy()
+            pred_obj_mask = torch.zeros_like(view.objects, dtype=torch.uint8).cpu().numpy()
 
         gt_objects = view.objects
         gt_rgb_mask = visualize_obj(gt_objects.cpu().numpy().astype(np.uint8))
@@ -139,6 +139,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             positive_input = "chopsticks;egg;glass of water;pork belly;wavy noodles in bowl;yellow bowl"
         elif 'teatime' in dataset.model_path:
             positive_input = "apple;bag of cookies;coffee mug;cookies on a plate;paper napkin;plate;sheep;spoon handle;stuffed bear;tea in a glass"
+        elif 'room' in dataset.model_path:
+            positive_input = "sofa;TV;keyboard;mouse;drinking glass;armchair"
         else:
             raise NotImplementedError   # You can provide your text prompt here
         
