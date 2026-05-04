@@ -10,25 +10,33 @@ Output: A structure like `figurines/` with:
   - test_mask/     (test views with text-prompt class masks from Grounded-SAM)
   - distorted/     (copy of sparse/, for MVS compatibility)
 
+Test view selection (choose ONE):
+  --num_test_views N     (default) take LAST N images
+  --test_indices 0 5 10  use specific indices (0-based in sorted order)
+  --test_files f1.jpg f2.jpg  use specific filenames
+
 Usage:
   # Only directory structure
   python script/data_prepare.py --source_path data/my_scene \
     --num_test_views 4 --skip_sam
 
-  # With object_mask (SAM Automatic)
+  # Pick specific views by index (e.g., first, middle, last)
   python script/data_prepare.py -s data/my_scene \
+    --test_indices 0 75 150 299 \
     --sam_checkpoint path/to/sam_vit_h_4b8939.pth
 
-  # With object_mask + test_mask (Grounded-SAM with text prompts)
+  # Pick specific views by filename
   python script/data_prepare.py -s data/my_scene \
+    --test_files 00001.jpg 00080.jpg 00150.jpg 00302.jpg \
+    --sam_checkpoint path/to/sam_vit_h_4b8939.pth
+
+  # Full: object_mask + test_mask (Grounded-SAM with text prompts)
+  python script/data_prepare.py -s data/my_scene \
+    --test_indices 0 75 150 299 \
     --sam_checkpoint path/to/sam_vit_h_4b8939.pth \
     --groundingdino_config path/to/GroundingDINO_SwinT_OGC.py \
     --groundingdino_checkpoint path/to/groundingdino_swint_ogc.pth \
     --text_prompts "green apple. red apple. toy chair. duck."
-
-Text prompt format:
-  - Separate classes with '. ' or use --text_prompts multiple times
-  - e.g., "green apple. red apple"  OR  --text_prompts "green apple" --text_prompts "red apple"
 """
 
 import os
@@ -54,13 +62,30 @@ def parse_args():
         required=True,
         help="Path to source directory containing images/ and sparse/",
     )
-    parser.add_argument(
+
+    test_group = parser.add_mutually_exclusive_group()
+    test_group.add_argument(
         "--num_test_views",
         "-n",
         type=int,
         default=4,
-        help="Number of test views to reserve (default: 4)",
+        help="Number of test views from the END (default: 4)",
     )
+    test_group.add_argument(
+        "--test_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Specific 0-based indices for test views, e.g., --test_indices 0 50 100 199",
+    )
+    test_group.add_argument(
+        "--test_files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Specific filenames for test views, e.g., --test_files 00001.jpg 00100.jpg",
+    )
+
     parser.add_argument(
         "--sam_checkpoint",
         type=str,
@@ -119,12 +144,6 @@ def parse_args():
 
 
 def parse_text_prompts(prompts_list: List[str]) -> List[str]:
-    """
-    Parse text prompts from command line.
-    Handles:
-      - --text_prompts "green apple. red apple. duck"
-      - --text_prompts "green apple" --text_prompts "red apple"
-    """
     all_prompts = []
     for item in prompts_list:
         for part in item.split("."):
@@ -144,21 +163,53 @@ def get_image_files(images_dir: str) -> List[str]:
     return files
 
 
-def split_train_test(
-    image_files: List[str], num_test: int
+def select_test_views(
+    image_files: List[str],
+    num_test: int = 4,
+    test_indices: Optional[List[int]] = None,
+    test_files: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str]]:
     """
-    Split images into train and test.
-    Test views = last N images (like typical NeRF/Gaussian-Splatting practice).
+    Select test views based on user choice:
+      - test_indices: specific 0-based indices in sorted order
+      - test_files: specific filenames
+      - num_test: take last N (default)
+
+    Returns: (train_files, test_files)
     """
+    if test_indices is not None:
+        test_set = set()
+        max_idx = len(image_files) - 1
+        for idx in test_indices:
+            if idx < 0 or idx > max_idx:
+                print(
+                    f"Warning: test index {idx} out of range [0, {max_idx}], ignoring"
+                )
+                continue
+            test_set.add(image_files[idx])
+        test_files_selected = [f for f in image_files if f in test_set]
+        train_files = [f for f in image_files if f not in test_set]
+        return train_files, test_files_selected
+
+    if test_files is not None:
+        available = set(image_files)
+        requested = set(test_files)
+        missing = requested - available
+        if missing:
+            print(f"Warning: test files not found: {sorted(missing)}")
+        test_set = requested & available
+        test_files_selected = [f for f in image_files if f in test_set]
+        train_files = [f for f in image_files if f not in test_set]
+        return train_files, test_files_selected
+
     if num_test <= 0:
         return image_files, []
     if num_test >= len(image_files):
         print(f"Warning: num_test_views={num_test} >= total images={len(image_files)}")
         return [], image_files
     train_files = image_files[:-num_test]
-    test_files = image_files[-num_test:]
-    return train_files, test_files
+    test_files_selected = image_files[-num_test:]
+    return train_files, test_files_selected
 
 
 def create_images_train(
@@ -206,9 +257,6 @@ def create_distorted(source_path: str):
 
 
 def create_test_mask_dirs(source_path: str, test_files: List[str]):
-    """
-    Create test_mask/0/, test_mask/1/ ... directories.
-    """
     test_mask_dir = path.join(source_path, "test_mask")
     makedirs(test_mask_dir, exist_ok=True)
 
@@ -224,12 +272,6 @@ def run_sam_segmentation(
     sam_model_type: str,
     device: str = "cuda",
 ):
-    """
-    Run SAM Automatic Mask Generator on all images.
-    Output: object_mask/<image_name>.png
-        - 0 = background
-        - 1,2,3... = instance IDs (sorted roughly by area)
-    """
     from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
     images_dir = path.join(source_path, "images")
@@ -290,17 +332,6 @@ def run_grounded_sam_test_mask(
     text_threshold: float = 0.45,
     device: str = "cuda",
 ):
-    """
-    Run Grounded-SAM on test views to generate text-prompt class masks.
-
-    For each test view and each text prompt:
-      - Run GroundingDINO to detect boxes
-      - Run SAM to get segmentation mask
-      - Save as: test_mask/<view_idx>/<class_name>.png
-
-    Output format (same as eval_lerf_mask.py expects):
-      - 0 = background, 255 = foreground (grayscale PNG)
-    """
     from segment_anything import sam_model_registry, SamPredictor
     from ext.grounded_sam import load_model_local, grouned_sam_output
 
@@ -385,10 +416,21 @@ def main():
 
     print(f"Found {len(image_files)} images in {images_dir}")
 
-    train_files, test_files = split_train_test(image_files, args.num_test_views)
+    train_files, test_files = select_test_views(
+        image_files,
+        num_test=args.num_test_views,
+        test_indices=args.test_indices,
+        test_files=args.test_files,
+    )
     print(f"Train: {len(train_files)}, Test: {len(test_files)}")
     if len(test_files) > 0:
-        print(f"  Test views (last N): {test_files[:3]} ... {test_files[-1:]}")
+        if args.test_indices is not None:
+            print(f"  Test selection: by --test_indices")
+        elif args.test_files is not None:
+            print(f"  Test selection: by --test_files")
+        else:
+            print(f"  Test selection: last {args.num_test_views} images")
+        print(f"  Test views: {test_files}")
 
     text_prompts = parse_text_prompts(args.text_prompts)
     if text_prompts:
@@ -435,6 +477,11 @@ def main():
                     "  --groundingdino_checkpoint /path/to/groundingdino_swint_ogc.pth"
                 )
                 print(f'  --text_prompts "{". ".join(text_prompts)}"')
+            print("")
+            print("To choose specific test views:")
+            print("  --test_indices 0 50 100 299    (by 0-based index)")
+            print("  OR")
+            print("  --test_files 00001.jpg 00100.jpg (by filename)")
             print("")
             print("You can download SAM checkpoints from:")
             print(
@@ -506,15 +553,13 @@ def main():
         )
     else:
         print(f"  test_mask/       -> {len(test_files)} view dirs (placeholders)")
+    if len(test_files) > 0:
+        print(f"  Test files:      -> {test_files}")
     print(f"  distorted/       -> copy of sparse/ for MVS compatibility")
     print("")
-    if not need_grounded_sam and len(test_files) > 0:
-        print("If test_mask/ is not auto-generated, you need to:")
-        print("  Put class-wise GT masks like:")
-        print("    test_mask/0/green apple.png")
-        print("    test_mask/0/red apple.png")
-        print("    ...")
-        print("  (0=background, 255=foreground, grayscale PNG)")
+    print("To change test views later:")
+    print("  Use --test_indices or --test_files to re-select")
+    print("  But NOTE: images_train/ and test_*.jpg naming depend on selection")
     print("=" * 70)
 
 
