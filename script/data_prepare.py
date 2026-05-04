@@ -130,9 +130,19 @@ def parse_args():
         help="Text threshold for GroundingDINO (default: 0.45)",
     )
     parser.add_argument(
+        "--skip_object_mask",
+        action="store_true",
+        help="Skip object_mask/ generation (SAM Automatic)",
+    )
+    parser.add_argument(
+        "--skip_test_mask",
+        action="store_true",
+        help="Skip test_mask/ generation (Grounded-SAM)",
+    )
+    parser.add_argument(
         "--skip_sam",
         action="store_true",
-        help="Skip SAM segmentation (only create directory structure)",
+        help="Skip ALL SAM segmentation (equivalent to --skip_object_mask --skip_test_mask)",
     )
     parser.add_argument(
         "--device",
@@ -443,11 +453,13 @@ def main():
 
     create_test_mask_dirs(source_path, test_files)
 
-    need_sam = (
-        not args.skip_sam and args.sam_checkpoint and path.exists(args.sam_checkpoint)
-    )
-    need_grounded_sam = (
-        need_sam
+    skip_all_sam = args.skip_sam
+    skip_object_mask = skip_all_sam or args.skip_object_mask
+    skip_test_mask = skip_all_sam or args.skip_test_mask
+
+    sam_ready = bool(args.sam_checkpoint and path.exists(args.sam_checkpoint))
+    grounded_sam_ready = bool(
+        sam_ready
         and text_prompts
         and args.groundingdino_config
         and path.exists(args.groundingdino_config)
@@ -455,61 +467,39 @@ def main():
         and path.exists(args.groundingdino_checkpoint)
     )
 
-    if args.skip_sam:
-        print("--skip_sam set, skipping all SAM segmentation")
-        object_mask_dir = path.join(source_path, "object_mask")
-        makedirs(object_mask_dir, exist_ok=True)
-    else:
-        if not args.sam_checkpoint or not path.exists(args.sam_checkpoint):
-            print("")
-            print("=" * 70)
-            print("SAM checkpoint not provided or not found.")
-            print("")
-            print("To generate object_mask/, provide:")
-            print("  --sam_checkpoint /path/to/sam_vit_h_4b8939.pth")
-            print("")
-            if text_prompts:
-                print(
-                    "To also generate test_mask/ with Grounded-SAM, additionally provide:"
-                )
-                print("  --groundingdino_config /path/to/GroundingDINO_SwinT_OGC.py")
-                print(
-                    "  --groundingdino_checkpoint /path/to/groundingdino_swint_ogc.pth"
-                )
-                print(f'  --text_prompts "{". ".join(text_prompts)}"')
-            print("")
-            print("To choose specific test views:")
-            print("  --test_indices 0 50 100 299    (by 0-based index)")
-            print("  OR")
-            print("  --test_files 00001.jpg 00100.jpg (by filename)")
-            print("")
-            print("You can download SAM checkpoints from:")
-            print(
-                "  https://github.com/facebookresearch/segment-anything#model-checkpoints"
-            )
-            print("")
-            print(
-                "Alternatively, run with --skip_sam to only create directory structure."
-            )
-            print("=" * 70)
-            print("")
-            object_mask_dir = path.join(source_path, "object_mask")
-            makedirs(object_mask_dir, exist_ok=True)
-        else:
-            all_images_for_sam = image_files.copy()
-            for i in range(len(test_files)):
-                extra_test_name = f"test_{i}.jpg"
-                if path.exists(path.join(images_dir, extra_test_name)):
-                    all_images_for_sam.append(extra_test_name)
-            run_sam_segmentation(
-                source_path,
-                all_images_for_sam,
-                args.sam_checkpoint,
-                args.sam_model_type,
-                args.device,
-            )
+    object_mask_dir = path.join(source_path, "object_mask")
+    makedirs(object_mask_dir, exist_ok=True)
 
-            if need_grounded_sam:
+    if skip_all_sam:
+        print("--skip_sam set, skipping ALL SAM segmentation")
+    else:
+        if not skip_object_mask:
+            if sam_ready:
+                all_images_for_sam = image_files.copy()
+                for i in range(len(test_files)):
+                    extra_test_name = f"test_{i}.jpg"
+                    if path.exists(path.join(images_dir, extra_test_name)):
+                        all_images_for_sam.append(extra_test_name)
+                run_sam_segmentation(
+                    source_path,
+                    all_images_for_sam,
+                    args.sam_checkpoint,
+                    args.sam_model_type,
+                    args.device,
+                )
+            else:
+                print("")
+                print("=" * 70)
+                print("SAM checkpoint not provided or not found.")
+                print("Skipping object_mask/ generation.")
+                print("")
+                print("To generate object_mask/, provide:")
+                print("  --sam_checkpoint /path/to/sam_vit_h_4b8939.pth")
+                print("=" * 70)
+                print("")
+
+        if not skip_test_mask and text_prompts:
+            if grounded_sam_ready:
                 run_grounded_sam_test_mask(
                     source_path,
                     test_files,
@@ -523,21 +513,20 @@ def main():
                     args.device,
                 )
             else:
-                if text_prompts:
-                    print("")
-                    print("=" * 70)
-                    print("Text prompts provided but GroundingDINO not ready.")
-                    print("test_mask/ was NOT auto-generated.")
-                    print("")
-                    print("To auto-generate test_mask/, provide:")
-                    print(
-                        "  --groundingdino_config /path/to/GroundingDINO_SwinT_OGC.py"
-                    )
-                    print(
-                        "  --groundingdino_checkpoint /path/to/groundingdino_swint_ogc.pth"
-                    )
-                    print("=" * 70)
-                    print("")
+                print("")
+                print("=" * 70)
+                print("Text prompts provided but Grounded-SAM not fully ready.")
+                print("Skipping test_mask/ auto-generation.")
+                print("")
+                print("To auto-generate test_mask/, ALL of these are needed:")
+                print("  --sam_checkpoint /path/to/sam_vit_h_4b8939.pth")
+                print("  --groundingdino_config /path/to/GroundingDINO_SwinT_OGC.py")
+                print(
+                    "  --groundingdino_checkpoint /path/to/groundingdino_swint_ogc.pth"
+                )
+                print(f'  --text_prompts "{". ".join(text_prompts)}"')
+                print("=" * 70)
+                print("")
 
     print("")
     print("=" * 70)
@@ -546,13 +535,23 @@ def main():
     print("Created/verified:")
     print(f"  images/          -> {len(image_files)} original images")
     print(f"  images_train/    -> {len(train_files)} training images")
-    print(f"  object_mask/     -> per-image instance segmentation")
-    if need_grounded_sam and text_prompts:
+    if skip_object_mask:
+        print(f"  object_mask/     -> skipped (--skip_object_mask or --skip_sam)")
+    elif sam_ready:
+        print(f"  object_mask/     -> per-image instance segmentation (auto-generated)")
+    else:
+        print(f"  object_mask/     -> placeholder (need SAM checkpoint to generate)")
+    if grounded_sam_ready and not skip_test_mask:
         print(
             f"  test_mask/       -> {len(test_files)} views x {len(text_prompts)} classes (auto-generated)"
         )
     else:
-        print(f"  test_mask/       -> {len(test_files)} view dirs (placeholders)")
+        if text_prompts and not skip_test_mask:
+            print(
+                f"  test_mask/       -> {len(test_files)} view dirs (needs GroundingDINO to auto-generate)"
+            )
+        else:
+            print(f"  test_mask/       -> {len(test_files)} view dirs (placeholders)")
     if len(test_files) > 0:
         print(f"  Test files:      -> {test_files}")
     print(f"  distorted/       -> copy of sparse/ for MVS compatibility")
