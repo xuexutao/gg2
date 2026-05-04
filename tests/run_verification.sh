@@ -52,9 +52,9 @@ RES="${2:-1}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-DATA_DIR="data/lerf_mask/${SCENE}"
-OUT_BASE="output/verify_${SCENE}_baseline"
-OUT_OURS="output/verify_${SCENE}_aniso"
+DATA_DIR="data/${SCENE}"
+OUT_BASE="output/${SCENE}_baseline"
+OUT_OURS="output/${SCENE}_aniso_only"
 
 CONFIG_BASE="config/gaussian_dataset/train.json"
 CONFIG_OURS="config/gaussian_dataset/train_aniso.json"
@@ -118,6 +118,7 @@ else
         --train_split \
         $ITER_ARGS 2>&1 | tee -a "$LOG_FILE"
 fi
+log "[step 1/5] Done"
 
 # -----------------------------------------------------------------------------
 # Step 2: train OURS (Gaussian Grouping + Anisotropic Affinity)
@@ -136,6 +137,7 @@ else
         --train_split \
         $ITER_ARGS 2>&1 | tee -a "$LOG_FILE"
 fi
+log "[step 2/5] Done"
 
 # -----------------------------------------------------------------------------
 # Step 3: render masks on the LERF-Mask test set using text prompts
@@ -155,6 +157,7 @@ render_one() {
 
 render_one "$OUT_BASE" "BASELINE" || true
 render_one "$OUT_OURS" "OURS"     || true
+log "[step 3/5] Done"
 
 # -----------------------------------------------------------------------------
 # Step 4: evaluate mIoU & Boundary-IoU for both, with a minimal eval harness.
@@ -169,6 +172,7 @@ python tests/eval_compare.py \
     --iteration      "$( [[ "${FAST:-0}" == "1" ]] && echo 3000 || echo 30000 )" \
     --out_json       "${LOG_DIR}/metrics_${SCENE}_${TS}.json" \
     2>&1 | tee -a "$LOG_FILE"
+log "[step 4/5] Done"
 
 # -----------------------------------------------------------------------------
 # Step 5: final summary
