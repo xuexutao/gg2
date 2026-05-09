@@ -109,6 +109,17 @@ class OptimizationParams(ParamGroup):
         self.reg3d_coarse_k = 64
         self.reg3d_normal_weight = 0.0
         self.reg3d_normal_only_same_group = True
+        self.reg3d_neg_weight = 0.0
+        self.reg3d_neg_k = 2
+        self.reg3d_neg_margin = 0.2
+        self.use_uncertainty_3d = False
+        self.use_uncertainty_2d = False
+        self.anisotropy_mode = "ratio"
+        self.use_anchor_weight = True
+        self.use_neighbor_weight = True
+        self.entropy_temperature = 1.0
+        self.entropy_weight_mode = "entropy"
+        self.entropy_min_weight = 0.5
 
         super().__init__(parser, "Optimization Parameters")
 

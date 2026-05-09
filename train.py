@@ -14,6 +14,9 @@ from utils.loss_utils import (
     ssim,
     loss_cls_3d,
     loss_cls_3d_aniso,
+    loss_cls_3d_aniso_uncertain,
+    pixel_entropy_weight,
+    weighted_2d_ce_loss,
 )
 from gaussian_renderer import render, network_gui
 import sys
@@ -126,10 +129,25 @@ def training(
         # Object Loss
         gt_obj = viewpoint_cam.objects.cuda().long()
         logits = classifier(objects)
-        loss_obj = (
-            cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
-        )
-        loss_obj = loss_obj / torch.log(torch.tensor(num_classes))  # normalize to (0,1)
+        if getattr(opt, "use_uncertainty_2d", False):
+            weight_map = pixel_entropy_weight(
+                logits,
+                temperature=getattr(opt, "entropy_temperature", 1.0),
+                mode=getattr(opt, "entropy_weight_mode", "entropy"),
+            )
+            loss_obj = weighted_2d_ce_loss(
+                cls_criterion,
+                logits,
+                gt_obj,
+                weight_map,
+                num_classes,
+                min_weight=getattr(opt, "entropy_min_weight", 0.5),
+            )
+        else:
+            loss_obj = (
+                cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
+            )
+            loss_obj = loss_obj / torch.log(torch.tensor(num_classes))  # normalize to (0,1)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -141,21 +159,43 @@ def training(
             logits3d = classifier(gaussians._objects_dc.permute(2, 0, 1))
             prob_obj3d = torch.softmax(logits3d, dim=0).squeeze().permute(1, 0)
             if getattr(opt, "use_aniso", False):
-                loss_obj_3d = loss_cls_3d_aniso(
-                    gaussians._xyz.squeeze().detach(),
-                    gaussians.get_scaling.detach(),
-                    gaussians._rotation.detach(),
-                    prob_obj3d,
-                    opt.reg3d_k,
-                    opt.reg3d_lambda_val,
-                    opt.reg3d_max_points,
-                    opt.reg3d_sample_size,
+                common_kwargs = dict(
                     coarse_k=getattr(opt, "reg3d_coarse_k", 64),
                     normal_weight=getattr(opt, "reg3d_normal_weight", 0.0),
                     normal_only_same_group=getattr(
                         opt, "reg3d_normal_only_same_group", True
                     ),
+                    neg_weight=getattr(opt, "reg3d_neg_weight", 0.0),
+                    neg_k=getattr(opt, "reg3d_neg_k", 2),
+                    neg_margin=getattr(opt, "reg3d_neg_margin", 0.2),
                 )
+                if getattr(opt, "use_uncertainty_3d", False):
+                    loss_obj_3d = loss_cls_3d_aniso_uncertain(
+                        gaussians._xyz.squeeze().detach(),
+                        gaussians.get_scaling.detach(),
+                        gaussians._rotation.detach(),
+                        prob_obj3d,
+                        opt.reg3d_k,
+                        opt.reg3d_lambda_val,
+                        opt.reg3d_max_points,
+                        opt.reg3d_sample_size,
+                        anisotropy_mode=getattr(opt, "anisotropy_mode", "ratio"),
+                        use_anchor_weight=getattr(opt, "use_anchor_weight", True),
+                        use_neighbor_weight=getattr(opt, "use_neighbor_weight", True),
+                        **common_kwargs,
+                    )
+                else:
+                    loss_obj_3d = loss_cls_3d_aniso(
+                        gaussians._xyz.squeeze().detach(),
+                        gaussians.get_scaling.detach(),
+                        gaussians._rotation.detach(),
+                        prob_obj3d,
+                        opt.reg3d_k,
+                        opt.reg3d_lambda_val,
+                        opt.reg3d_max_points,
+                        opt.reg3d_sample_size,
+                        **common_kwargs,
+                    )
             else:
                 loss_obj_3d = loss_cls_3d(
                     gaussians._xyz.squeeze().detach(),
@@ -441,6 +481,17 @@ if __name__ == "__main__":
     args.reg3d_coarse_k = config.get("reg3d_coarse_k", 64)
     args.reg3d_normal_weight = config.get("reg3d_normal_weight", 0.0)
     args.reg3d_normal_only_same_group = config.get("reg3d_normal_only_same_group", True)
+    args.reg3d_neg_weight = config.get("reg3d_neg_weight", 0.0)
+    args.reg3d_neg_k = config.get("reg3d_neg_k", 2)
+    args.reg3d_neg_margin = config.get("reg3d_neg_margin", 0.2)
+    args.use_uncertainty_3d = config.get("use_uncertainty_3d", False)
+    args.use_uncertainty_2d = config.get("use_uncertainty_2d", False)
+    args.anisotropy_mode = config.get("anisotropy_mode", "ratio")
+    args.use_anchor_weight = config.get("use_anchor_weight", True)
+    args.use_neighbor_weight = config.get("use_neighbor_weight", True)
+    args.entropy_temperature = config.get("entropy_temperature", 1.0)
+    args.entropy_weight_mode = config.get("entropy_weight_mode", "entropy")
+    args.entropy_min_weight = config.get("entropy_min_weight", 0.5)
 
     print("Optimizing " + args.model_path)
 

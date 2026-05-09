@@ -313,6 +313,70 @@ def test_backward_compatibility_with_original():
     print("[OK] test_backward_compatibility_with_original")
 
 
+def test_boundary_negative_penalty_reacts_to_cross_face_confusion():
+    """Boundary-negative term should penalize thin-wall cross-face confusion."""
+    torch.manual_seed(5)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    eps = 0.02
+    grid = torch.linspace(0, 1, 10, device=device)
+    xx, yy = torch.meshgrid(grid, grid, indexing="xy")
+    xy_flat = torch.stack([xx.flatten(), yy.flatten()], dim=-1)
+
+    front = torch.cat([xy_flat, torch.full((100, 1), +eps, device=device)], dim=-1)
+    back = torch.cat([xy_flat, torch.full((100, 1), -eps, device=device)], dim=-1)
+    xyz = torch.cat([front, back], dim=0)
+
+    scaling = torch.empty(200, 3, device=device)
+    scaling[:100] = torch.tensor([0.1, 0.1, 0.005], device=device)
+    scaling[100:] = torch.tensor([0.005, 0.1, 0.1], device=device)
+    rotation = _identity_quat(200, device)
+
+    confused = torch.full((200, 2), 0.5, device=device)
+    separated = torch.zeros(200, 2, device=device)
+    separated[:100, 0] = 0.99
+    separated[:100, 1] = 0.01
+    separated[100:, 0] = 0.01
+    separated[100:, 1] = 0.99
+
+    confused_loss = loss_cls_3d_aniso(
+        xyz,
+        scaling,
+        rotation,
+        confused,
+        k=5,
+        lambda_val=0.0,
+        max_points=200,
+        sample_size=128,
+        coarse_k=32,
+        neg_weight=1.0,
+        neg_k=3,
+        neg_margin=0.2,
+    )
+    separated_loss = loss_cls_3d_aniso(
+        xyz,
+        scaling,
+        rotation,
+        separated,
+        k=5,
+        lambda_val=0.0,
+        max_points=200,
+        sample_size=128,
+        coarse_k=32,
+        neg_weight=1.0,
+        neg_k=3,
+        neg_margin=0.2,
+    )
+    assert confused_loss.item() > separated_loss.item() + 0.05, (
+        "Boundary-negative term should penalize cross-face confusion more strongly; "
+        f"got confused={confused_loss.item():.4f}, separated={separated_loss.item():.4f}"
+    )
+    print(
+        "[OK] test_boundary_negative_penalty_reacts_to_cross_face_confusion  "
+        f"confused={confused_loss.item():.4f} separated={separated_loss.item():.4f}"
+    )
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("Anisotropic Affinity loss — unit tests")
@@ -322,6 +386,7 @@ if __name__ == "__main__":
     test_normal_extraction()
     test_normal_consistency_loss_zero_when_aligned()
     test_backward_compatibility_with_original()
+    test_boundary_negative_penalty_reacts_to_cross_face_confusion()
     test_thin_wall_differentiation()
     print("=" * 70)
     print("All tests passed.")

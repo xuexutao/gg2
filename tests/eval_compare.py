@@ -29,6 +29,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -89,7 +90,16 @@ def evaluate_model(scene, model_dir, iteration):
     Returns dict {"mIoU": float, "mBIoU": float, "per_class_iou": {...}, "per_class_biou": {...}}.
     If the rendered output is missing, returns None.
     """
-    gt_root = Path("data/lerf_mask") / scene / "test_mask"
+    # Be robust to CWD: resolve paths relative to repo root.
+    repo_root = Path(__file__).resolve().parents[1]
+
+    # Official LERF-Mask layout is: data/lerf_mask/<scene>/test_mask
+    # Some local datasets may follow: data/<scene>/test_mask
+    gt_candidates = [
+        repo_root / "data" / "lerf_mask" / scene / "test_mask",
+        repo_root / "data" / scene / "test_mask",
+    ]
+    gt_root = next((p for p in gt_candidates if p.is_dir()), gt_candidates[0])
     pred_root = Path(model_dir) / "test" / f"ours_{iteration}_text" / "test_mask"
 
     if not gt_root.is_dir():
@@ -99,27 +109,40 @@ def evaluate_model(scene, model_dir, iteration):
         print(f"[ERROR] Pred dir missing: {pred_root}")
         return None
 
-    # GT view dirs are named by view index, e.g., "0", "2" (not all test views have GT)
-    # Pred view dirs are named by rendering index, e.g., "0", "1", "2", ..., "22" (all test views)
-    # Match by directory NAME, not by position!
     gt_view_dirs = sorted([d for d in gt_root.iterdir() if d.is_dir()])
-    pred_view_dirs = {d.name: d for d in pred_root.iterdir() if d.is_dir()}
+    pred_view_dirs = sorted([d for d in pred_root.iterdir() if d.is_dir()])
+    pred_by_name = {d.name: d for d in pred_view_dirs}
 
+    # Primary strategy: match by directory name (works for the official LERF-Mask layout
+    # where GT view dirs are numeric indices).
+    # Fallback: match by positional index in sorted order (handles layouts where GT
+    # dirs are view-image names but preds are numeric indices).
+    def match_pred_dir(gt_idx: int, gt_view_dir: Path) -> Optional[Path]:
+        if gt_view_dir.name in pred_by_name:
+            return pred_by_name[gt_view_dir.name]
+        if gt_idx < len(pred_view_dirs):
+            return pred_view_dirs[gt_idx]
+        return None
+
+    print(f"[DEBUG] GT root: {gt_root}")
+    print(f"[DEBUG] Pred root: {pred_root}")
     print(f"[DEBUG] GT views: {[d.name for d in gt_view_dirs]}")
-    print(f"[DEBUG] Pred views available: {sorted(pred_view_dirs.keys())[:10]}...")
+    print(f"[DEBUG] Pred views available: {[d.name for d in pred_view_dirs[:10]]}...")
 
     per_class_iou = {}
     per_class_biou = {}
 
-    for gt_view_dir in gt_view_dirs:
-        view_idx = gt_view_dir.name
-
-        if view_idx not in pred_view_dirs:
-            print(f"[WARN] GT view {view_idx} not found in pred, skipping")
+    for gi, gt_view_dir in enumerate(gt_view_dirs):
+        pred_view_dir = match_pred_dir(gi, gt_view_dir)
+        if pred_view_dir is None:
+            print(
+                f"[WARN] GT view {gt_view_dir.name} has no corresponding pred view (gi={gi}), skipping"
+            )
             continue
 
-        pred_view_dir = pred_view_dirs[view_idx]
-        print(f"[DEBUG] Matching GT view {view_idx} → Pred view {view_idx}")
+        print(
+            f"[DEBUG] Matching GT view {gt_view_dir.name} → Pred view {pred_view_dir.name}"
+        )
 
         for cat_file in os.listdir(gt_view_dir):
             if not cat_file.endswith(".png"):

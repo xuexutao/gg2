@@ -1,0 +1,68 @@
+==========================================================================================
+Diagnosing render_lerf_mask output
+scene      : room
+model_dir  : output/room_aniso_only
+iteration  : 30000
+gt_root    : data/lerf_mask/room/test_mask
+render_root: output/room_aniso_only/test/ours_30000_text
+pred_root  : output/room_aniso_only/test/ours_30000_text/test_mask
+==========================================================================================
+Prompts: ['sofa', 'TV', 'keyboard', 'mouse', 'drinking glass', 'armchair']
+
+------------------------------------------------------------------------------------------
+Prompt: sofa
+  Grounded-SAM visualization exists: output/room_aniso_only/test/ours_30000_text/grounded-sam---sofa.png
+  view=0    GT_px=428759   Pred_px=121912   IoU=0.2166
+  view=1    GT_px=1303056  Pred_px=4848     IoU=0.0010
+  view=2    GT_px=1082343  Pred_px=106064   IoU=0.0070
+  view=3    GT_px=2054042  Pred_px=19440    IoU=0.0092
+  Summary: mean_IoU=0.0585, total_GT_px=4868200, total_Pred_px=252264
+------------------------------------------------------------------------------------------
+Prompt: TV
+  Grounded-SAM visualization exists: output/room_aniso_only/test/ours_30000_text/grounded-sam---TV.png
+  view=0    GT_px=750574   Pred_px=670316   IoU=0.4392
+  view=1    GT_px=0        Pred_px=944780   IoU=0.0000
+  view=2    GT_px=0        Pred_px=908083   IoU=0.0000
+  view=3    GT_px=0        Pred_px=1404364  IoU=0.0000
+  Summary: mean_IoU=0.1098, total_GT_px=750574, total_Pred_px=3927543
+------------------------------------------------------------------------------------------
+Prompt: keyboard
+  Grounded-SAM visualization exists: output/room_aniso_only/test/ours_30000_text/grounded-sam---keyboard.png
+  view=0    GT_px=41133    Pred_px=0        IoU=0.0000
+  view=1    GT_px=23970    Pred_px=0        IoU=0.0000
+  view=2    GT_px=0        Pred_px=0        IoU=0.0000
+  view=3    GT_px=17029    Pred_px=0        IoU=0.0000
+  Summary: mean_IoU=0.0000, total_GT_px=82132, total_Pred_px=0
+  [WARN] Pred all-zero on views: ['0', '1', '2', '3']
+------------------------------------------------------------------------------------------
+Prompt: mouse
+  Grounded-SAM visualization exists: output/room_aniso_only/test/ours_30000_text/grounded-sam---mouse.png
+  view=0    GT_px=3695     Pred_px=0        IoU=0.0000
+  view=1    GT_px=2456     Pred_px=0        IoU=0.0000
+  view=2    GT_px=0        Pred_px=0        IoU=0.0000
+  view=3    GT_px=2693     Pred_px=0        IoU=0.0000
+  Summary: mean_IoU=0.0000, total_GT_px=8844, total_Pred_px=0
+  [WARN] Pred all-zero on views: ['0', '1', '2', '3']
+------------------------------------------------------------------------------------------
+Prompt: drinking glass
+  Grounded-SAM visualization exists: output/room_aniso_only/test/ours_30000_text/grounded-sam---drinking glass.png
+  view=0    GT_px=39179    Pred_px=304      IoU=0.0000
+  view=1    GT_px=79656    Pred_px=0        IoU=0.0000
+  view=2    GT_px=61614    Pred_px=0        IoU=0.0000
+  view=3    GT_px=44931    Pred_px=0        IoU=0.0000
+  Summary: mean_IoU=0.0000, total_GT_px=225380, total_Pred_px=304
+  [WARN] Pred all-zero on views: ['1', '2', '3']
+------------------------------------------------------------------------------------------
+Prompt: armchair
+  Grounded-SAM visualization exists: output/room_aniso_only/test/ours_30000_text/grounded-sam---armchair.png
+  view=0    GT_px=428736   Pred_px=100548   IoU=0.2233
+  view=1    GT_px=422288   Pred_px=848      IoU=0.0004
+  view=2    GT_px=1082221  Pred_px=2192     IoU=0.0000
+  view=3    GT_px=2054113  Pred_px=4512     IoU=0.0021
+  Summary: mean_IoU=0.0565, total_GT_px=3987358, total_Pred_px=108100
+
+Next check suggestions:
+1. Open grounded-sam---<prompt>.png and compare with prompt-level IoU above.
+2. If grounded-sam looks good but Pred_px is often 0, the issue is likely selected_obj_ids / IOA filtering.
+3. If Pred_px is huge for many prompts, the issue is likely probability-threshold leakage.
+4. Also compare with render.py outputs in objects_pred/ to see whether the classifier itself is already fragmented.

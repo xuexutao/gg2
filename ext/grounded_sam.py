@@ -127,18 +127,109 @@ def grouned_sam_output(groundingdino_model, sam_predictor, TEXT_PROMPT, image, B
     return torch.sum(masks,dim=0).squeeze().bool(), annotated_frame_with_mask
 
 
-def select_obj_ioa(classification_maps, mask, ioa_thresh=0.7):
-    unique_classes = classification_maps.unique()
-    classes_above_threshold = []
+def select_obj_ioa(
+    classification_maps,
+    mask,
+    ioa_thresh=0.7,
+    topk_fallback: int = 3,
+):
+    """Select predicted object IDs that best match a text mask.
 
-    for class_id in unique_classes:
-        class_mask = (classification_maps == class_id).byte()
-        class_area = class_mask.sum()
-        intersection = torch.sum(class_mask * mask)
-        ioa = intersection / class_area if class_area != 0 else 0  # Avoid division by zero
-        
-        if ioa > ioa_thresh:
-            classes_above_threshold.append(class_id)
+    The upstream heuristic used only IOA (= intersection / class_area) with a high
+    threshold (default 0.7). This works for large, compact objects but can fail
+    badly for small objects (mouse/keyboard/glass) where the predicted class area
+    is much larger than the Grounded-SAM mask → IOA becomes tiny → selects none →
+    all-zero prediction masks.
 
-    return torch.tensor(classes_above_threshold).cuda()
+    We keep the original behavior when IOA passes the threshold, but add a robust
+    fallback that picks the best matching classes by an F1-like score combining:
+      - precision  : IOA  = inter / class_area
+      - recall     : inter / mask_area
+    This prevents empty selections and makes evaluation stable across object sizes.
+    """
 
+    device = classification_maps.device
+    mask_f = mask.to(torch.float32)
+    mask_area = float(mask_f.sum().item())
+    if mask_area <= 0:
+        return torch.empty((0,), device=device, dtype=torch.long)
+
+    # Dynamic minimum intersection to suppress pure-noise matches.
+    # Use a low ratio so small objects (mouse/keyboard) can still be selected.
+    min_inter = float(max(10, int(mask_area * 0.005)))
+
+    # ---------------------------------------------------------------------
+    # Case A: discrete argmax map (H, W)
+    # ---------------------------------------------------------------------
+    if classification_maps.dim() == 2:
+        unique_classes = classification_maps.unique()
+        selected = []
+        scored = []  # (class_id, f1)
+
+        mask_u8 = (mask_f > 0.5).to(torch.uint8)
+        for class_id in unique_classes:
+            class_mask = (classification_maps == class_id).to(torch.uint8)
+            class_area = float(class_mask.sum().item())
+            if class_area <= 0:
+                continue
+
+            inter = float((class_mask * mask_u8).sum().item())
+            if inter <= 0:
+                continue
+
+            ioa = inter / class_area
+            recall = inter / mask_area
+            f1 = (2.0 * ioa * recall) / (ioa + recall + 1e-6)
+
+            if ioa > ioa_thresh:
+                selected.append(int(class_id.item()))
+            if inter >= min_inter:
+                scored.append((int(class_id.item()), float(f1)))
+
+        if selected:
+            return torch.as_tensor(selected, device=device, dtype=torch.long)
+        if scored:
+            scored.sort(key=lambda x: x[1], reverse=True)
+            chosen = [cid for (cid, _score) in scored[: max(1, topk_fallback)]]
+            return torch.as_tensor(chosen, device=device, dtype=torch.long)
+        return torch.empty((0,), device=device, dtype=torch.long)
+
+    # ---------------------------------------------------------------------
+    # Case B: soft probability map (C, H, W)
+    #   This is much more robust for small objects where the correct class may
+    #   never win argmax on any pixel, yet still has concentrated probability.
+    # ---------------------------------------------------------------------
+    if classification_maps.dim() == 3:
+        prob = classification_maps.to(torch.float32)
+        C = prob.shape[0]
+        mask_f = mask_f.to(prob.device)
+
+        # expected mass within mask per class (<= mask_area)
+        inter = (prob * mask_f.unsqueeze(0)).sum(dim=(1, 2))  # (C,)
+        # expected class area (<= H*W)
+        class_area = prob.sum(dim=(1, 2)) + 1e-6
+
+        ioa = inter / class_area
+        recall = inter / (mask_area + 1e-6)
+        f1 = (2.0 * ioa * recall) / (ioa + recall + 1e-6)
+
+        # Only consider classes with meaningful overlap.
+        valid = inter >= min_inter
+        selected = torch.nonzero((ioa > ioa_thresh) & valid, as_tuple=False).squeeze(-1)
+        if selected.numel() > 0:
+            return selected.to(device=device, dtype=torch.long)
+
+        # Fallback: take top-k by f1 among valid; if none valid, return empty.
+        if valid.any():
+            f1_valid = f1.masked_fill(~valid, -1.0)
+            k = max(1, topk_fallback)
+            _, idx = torch.topk(f1_valid, k=min(k, C), largest=True)
+            # filter out the masked -1.0 entries
+            idx = idx[f1_valid[idx] > 0]
+            return idx.to(device=device, dtype=torch.long)
+
+        return torch.empty((0,), device=device, dtype=torch.long)
+
+    raise ValueError(
+        f"select_obj_ioa expects (H,W) argmax map or (C,H,W) prob map, got shape={tuple(classification_maps.shape)}"
+    )

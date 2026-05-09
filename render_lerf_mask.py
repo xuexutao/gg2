@@ -74,6 +74,10 @@ def render_set(
     rendering0 = results0["render"]
     rendering_obj0 = results0["render_object"]
     logits = classifier(rendering_obj0)
+    # Use SOFT probabilities for prompt→object-id matching.
+    # Argmax maps can miss small objects entirely (no pixel wins argmax), which
+    # leads to empty selected_obj_ids and all-zero masks.
+    prob0 = torch.softmax(logits, dim=0)
     pred_obj = torch.argmax(logits, dim=0)
 
     image = (rendering0.permute(1, 2, 0) * 255).cpu().numpy().astype("uint8")
@@ -83,24 +87,33 @@ def render_set(
     Image.fromarray(annotated_frame_with_mask).save(
         os.path.join(render_path[:-8], "grounded-sam---" + TEXT_PROMPT + ".png")
     )
-    selected_obj_ids = select_obj_ioa(pred_obj, text_mask)
+    selected_obj_ids = select_obj_ioa(prob0, text_mask)
 
     if debug_prompt_selection:
-        unique_ids = pred_obj.unique()
+        # Report top classes by *soft* IOA for easier debugging.
+        text_mask_f = text_mask.to(torch.float32)
+        inter = (prob0 * text_mask_f.unsqueeze(0)).sum(dim=(1, 2))
+        class_area = prob0.sum(dim=(1, 2)) + 1e-6
+        ioa = (inter / class_area).detach().cpu().numpy()
+        inter_np = inter.detach().cpu().numpy()
+        class_area_np = class_area.detach().cpu().numpy()
+
         debug_rows = []
-        text_mask_u8 = text_mask.to(torch.uint8)
-        for class_id in unique_ids:
-            class_mask = (pred_obj == class_id).to(torch.uint8)
-            class_area = int(class_mask.sum().item())
-            inter = int((class_mask * text_mask_u8).sum().item())
-            ioa = float(inter / class_area) if class_area > 0 else 0.0
-            debug_rows.append((int(class_id.item()), ioa, class_area, inter))
+        for cid in range(prob0.shape[0]):
+            debug_rows.append(
+                (
+                    int(cid),
+                    float(ioa[cid]),
+                    float(class_area_np[cid]),
+                    float(inter_np[cid]),
+                )
+            )
         debug_rows.sort(key=lambda x: x[1], reverse=True)
         debug_file = os.path.join(debug_path, TEXT_PROMPT + ".txt")
         with open(debug_file, "w") as f:
             f.write(f"prompt={TEXT_PROMPT}\n")
             f.write(f"selected_obj_ids={[int(x.item()) for x in selected_obj_ids]}\n")
-            f.write(f"text_mask_pixels={int(text_mask_u8.sum().item())}\n")
+            f.write(f"text_mask_pixels={int(text_mask_f.sum().item())}\n")
             f.write("top_ioa_classes:\n")
             for class_id, ioa, class_area, inter in debug_rows[:20]:
                 f.write(
@@ -119,9 +132,20 @@ def render_set(
         if len(selected_obj_ids) > 0:
             prob = torch.softmax(logits, dim=0)
 
-            pred_obj_mask = prob[selected_obj_ids, :, :] > threshold
-            pred_obj_mask = pred_obj_mask.any(dim=0)
-            pred_obj_mask = (pred_obj_mask.squeeze().cpu().numpy() * 255).astype(
+            # Thresholding can easily erase small objects (mouse/glass) even when
+            # the correct IDs are selected. Use a simple adaptive fallback.
+            def build_mask(th: float):
+                m = prob[selected_obj_ids, :, :] > th
+                return m.any(dim=0)
+
+            pred_obj_mask_t = build_mask(threshold)
+            if not bool(pred_obj_mask_t.any().item()):
+                for th in [threshold * 0.5, threshold * 0.25]:
+                    pred_obj_mask_t = build_mask(th)
+                    if bool(pred_obj_mask_t.any().item()):
+                        break
+
+            pred_obj_mask = (pred_obj_mask_t.squeeze().cpu().numpy() * 255).astype(
                 np.uint8
             )
         else:

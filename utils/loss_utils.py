@@ -143,6 +143,9 @@ def loss_cls_3d_aniso(
     coarse_k=64,
     normal_weight=0.0,
     normal_only_same_group=True,
+    neg_weight=0.0,
+    neg_k=2,
+    neg_margin=0.2,
     eps=1e-6,
 ):
     """
@@ -160,7 +163,10 @@ def loss_cls_3d_aniso(
          of O(sample_size * N), keeping the loss cheap.
       4. KL divergence between anchor identity distribution and neighbor
          identity distributions (same as original).
-      5. (optional) Normal Consistency loss on the resulting neighborhood:
+      5. (optional) Boundary-Aware negative mining within the same coarse
+         Euclidean neighborhood: spatially-close but anisotropically-far
+         Gaussians should not share the same identity distribution.
+      6. (optional) Normal Consistency loss on the resulting neighborhood:
          anchor and neighbor normals should agree up to sign.
 
     This is a drop-in replacement for the original `loss_cls_3d`; the only
@@ -191,6 +197,7 @@ def loss_cls_3d_aniso(
         dists_eu = torch.cdist(xyz_a, xyz)
         coarse_k_eff = min(coarse_k, N)
         _, coarse_idx = dists_eu.topk(coarse_k_eff, largest=False)  # (sample, coarse_k)
+        dists_eu_coarse = dists_eu.gather(1, coarse_idx).clamp(min=eps)
 
     # --- Step 3b: Mahalanobis re-ranking among the coarse candidates ---
     # Build covariances only for anchors and the coarse candidate union.
@@ -237,7 +244,33 @@ def loss_cls_3d_aniso(
 
     total = lambda_val * kl_loss
 
-    # --- Step 5: Normal Consistency Loss (optional) ---
+    # --- Step 5: Boundary-aware negative pairs inside the same Euclidean ball ---
+    if neg_weight > 0.0 and Ck > k_eff:
+        neg_k_eff = min(neg_k, Ck - k_eff)
+        pos_mask = torch.zeros_like(d_maha, dtype=torch.bool)
+        pos_mask.scatter_(1, topk_in_coarse, True)
+
+        boundary_score = d_maha / dists_eu_coarse
+        score_neg = boundary_score.masked_fill(pos_mask, float("-inf"))
+        _, neg_in_coarse = score_neg.topk(neg_k_eff, largest=True)
+        neg_row_idx = torch.arange(M, device=device).unsqueeze(1).expand(-1, neg_k_eff)
+        neg_indices = coarse_idx[neg_row_idx, neg_in_coarse]  # (M, neg_k)
+        neg_preds = predictions[neg_indices]
+
+        # same_prob close to 1 means the model still wants to merge a pair that is
+        # spatially close but structurally inconsistent under the anisotropic metric.
+        neg_same_prob = (pred_a.unsqueeze(1) * neg_preds).sum(dim=-1)  # (M, neg_k)
+
+        pos_score = boundary_score.gather(1, topk_in_coarse).mean(dim=-1, keepdim=True)
+        neg_score = boundary_score.gather(1, neg_in_coarse)
+        boundary_w = torch.clamp(neg_score - pos_score, min=0.0)
+        boundary_w = boundary_w.detach()
+
+        neg_penalty = F.relu(neg_same_prob - neg_margin)
+        neg_loss = (neg_penalty * boundary_w).sum() / (boundary_w.sum() + 1e-6)
+        total = total + neg_weight * neg_loss
+
+    # --- Step 6: Normal Consistency Loss (optional) ---
     if normal_weight > 0.0:
         normals = gaussian_normals(scaling, rotation)  # (N, 3)
         n_a = normals[idx_anchor]  # (M, 3)
@@ -405,6 +438,9 @@ def loss_cls_3d_aniso_uncertain(
     anisotropy_mode="ratio",
     use_anchor_weight=True,
     use_neighbor_weight=True,
+    neg_weight=0.0,
+    neg_k=2,
+    neg_margin=0.2,
     eps=1e-6,
 ):
     """
@@ -456,6 +492,7 @@ def loss_cls_3d_aniso_uncertain(
         dists_eu = torch.cdist(xyz_a, xyz)
         coarse_k_eff = min(coarse_k, N)
         _, coarse_idx = dists_eu.topk(coarse_k_eff, largest=False)
+        dists_eu_coarse = dists_eu.gather(1, coarse_idx).clamp(min=eps)
 
     # --- Step 3b: Mahalanobis re-ranking among the coarse candidates ---
     cov_a = _build_covariance(scl_a, rot_a)  # (M, 3, 3)
@@ -511,7 +548,37 @@ def loss_cls_3d_aniso_uncertain(
 
     total = lambda_val * kl_loss
 
-    # --- Step 5: Normal Consistency (weighted) ---
+    # --- Step 5: Boundary-aware negative pairs inside the same Euclidean ball ---
+    if neg_weight > 0.0 and Ck > k_eff:
+        neg_k_eff = min(neg_k, Ck - k_eff)
+        pos_mask = torch.zeros_like(d_maha, dtype=torch.bool)
+        pos_mask.scatter_(1, topk_in_coarse, True)
+
+        boundary_score = d_maha / dists_eu_coarse
+        score_neg = boundary_score.masked_fill(pos_mask, float("-inf"))
+        _, neg_in_coarse = score_neg.topk(neg_k_eff, largest=True)
+        neg_row_idx = torch.arange(M, device=device).unsqueeze(1).expand(-1, neg_k_eff)
+        neg_indices = coarse_idx[neg_row_idx, neg_in_coarse]
+        neg_preds = predictions[neg_indices]
+
+        neg_same_prob = (pred_a.unsqueeze(1) * neg_preds).sum(dim=-1)
+        pos_score = boundary_score.gather(1, topk_in_coarse).mean(dim=-1, keepdim=True)
+        neg_score = boundary_score.gather(1, neg_in_coarse)
+        boundary_w = torch.clamp(neg_score - pos_score, min=0.0)
+        boundary_w = boundary_w.detach()
+
+        neg_pair_w = boundary_w
+        if use_anchor_weight:
+            neg_pair_w = neg_pair_w * w_a.unsqueeze(1)
+        if use_neighbor_weight:
+            neg_pair_w = neg_pair_w * aniso_w[neg_indices]
+        neg_pair_w = torch.clamp(neg_pair_w, min=0.05).detach()
+
+        neg_penalty = F.relu(neg_same_prob - neg_margin)
+        neg_loss = (neg_penalty * neg_pair_w).sum() / (neg_pair_w.sum() + 1e-6)
+        total = total + neg_weight * neg_loss
+
+    # --- Step 6: Normal Consistency (weighted) ---
     if normal_weight > 0.0:
         normals = gaussian_normals(scaling, rotation)
         n_a = normals[idx_anchor]
