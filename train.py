@@ -57,6 +57,25 @@ def training(
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+        # Best-effort resume for the 2D classifier.
+        # The original checkpoint only stores GaussianModel state; classifier is
+        # saved separately under point_cloud/iteration_<iter>/classifier.pth.
+        try:
+            cls_ckpt = os.path.join(
+                scene.model_path,
+                "point_cloud",
+                f"iteration_{first_iter}",
+                "classifier.pth",
+            )
+            if os.path.isfile(cls_ckpt):
+                classifier.load_state_dict(torch.load(cls_ckpt, map_location="cpu"))
+                classifier.cuda()
+                print(f"[resume] loaded classifier from {cls_ckpt}")
+            else:
+                print(f"[resume] classifier checkpoint not found: {cls_ckpt}")
+        except Exception as e:
+            print(f"[resume] failed to load classifier checkpoint: {e}")
+
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -292,6 +311,28 @@ def training(
                 cls_optimizer.step()
                 cls_optimizer.zero_grad()
 
+                # ------------------------------------------------------------------
+                # Engineering split trick: split ambiguous cross-object Gaussians
+                # Run AFTER optimizer/densification so we don't break masks computed
+                # earlier in this iteration.
+                # ------------------------------------------------------------------
+                if getattr(opt, "enable_obj_split", False):
+                    if (
+                        iteration >= getattr(opt, "obj_split_start_iter", 1000)
+                        and iteration <= getattr(opt, "obj_split_end_iter", 10000)
+                        and iteration % getattr(opt, "obj_split_interval", 200) == 0
+                    ):
+                        split_n = gaussians.obj_aware_split(
+                            classifier,
+                            entropy_thresh=getattr(opt, "obj_split_entropy_thresh", 3.0),
+                            top2_margin=getattr(opt, "obj_split_top2_margin", 0.10),
+                            max_per_step=getattr(opt, "obj_split_max_per_step", 2048),
+                            feat_step=getattr(opt, "obj_split_feat_step", 0.15),
+                            pos_jitter=getattr(opt, "obj_split_pos_jitter", 0.15),
+                        )
+                        if split_n > 0:
+                            print(f"[split] iter={iteration} split_points={split_n}")
+
             if iteration in checkpoint_iterations:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save(
@@ -469,29 +510,43 @@ if __name__ == "__main__":
         print(f"Error: Failed to parse the JSON configuration file: {e}")
         exit(1)
 
-    args.densify_until_iter = config.get("densify_until_iter", 15000)
-    args.num_classes = config.get("num_classes", 200)
-    args.reg3d_interval = config.get("reg3d_interval", 2)
-    args.reg3d_k = config.get("reg3d_k", 5)
-    args.reg3d_lambda_val = config.get("reg3d_lambda_val", 2)
-    args.reg3d_max_points = config.get("reg3d_max_points", 300000)
-    args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
+    # NOTE: allow command-line to override config by using the current args.* as default.
+    args.densify_until_iter = config.get("densify_until_iter", getattr(args, "densify_until_iter", 15000))
+    args.num_classes = config.get("num_classes", getattr(args, "num_classes", 200))
+    args.reg3d_interval = config.get("reg3d_interval", getattr(args, "reg3d_interval", 2))
+    args.reg3d_k = config.get("reg3d_k", getattr(args, "reg3d_k", 5))
+    args.reg3d_lambda_val = config.get("reg3d_lambda_val", getattr(args, "reg3d_lambda_val", 2))
+    args.reg3d_max_points = config.get("reg3d_max_points", getattr(args, "reg3d_max_points", 300000))
+    args.reg3d_sample_size = config.get("reg3d_sample_size", getattr(args, "reg3d_sample_size", 1000))
     # -- Anisotropic Affinity (our contribution) --------------------------
-    args.use_aniso = config.get("use_aniso", False)
-    args.reg3d_coarse_k = config.get("reg3d_coarse_k", 64)
-    args.reg3d_normal_weight = config.get("reg3d_normal_weight", 0.0)
-    args.reg3d_normal_only_same_group = config.get("reg3d_normal_only_same_group", True)
-    args.reg3d_neg_weight = config.get("reg3d_neg_weight", 0.0)
-    args.reg3d_neg_k = config.get("reg3d_neg_k", 2)
-    args.reg3d_neg_margin = config.get("reg3d_neg_margin", 0.2)
-    args.use_uncertainty_3d = config.get("use_uncertainty_3d", False)
-    args.use_uncertainty_2d = config.get("use_uncertainty_2d", False)
-    args.anisotropy_mode = config.get("anisotropy_mode", "ratio")
-    args.use_anchor_weight = config.get("use_anchor_weight", True)
-    args.use_neighbor_weight = config.get("use_neighbor_weight", True)
-    args.entropy_temperature = config.get("entropy_temperature", 1.0)
-    args.entropy_weight_mode = config.get("entropy_weight_mode", "entropy")
-    args.entropy_min_weight = config.get("entropy_min_weight", 0.5)
+    args.use_aniso = config.get("use_aniso", getattr(args, "use_aniso", False))
+    args.reg3d_coarse_k = config.get("reg3d_coarse_k", getattr(args, "reg3d_coarse_k", 64))
+    args.reg3d_normal_weight = config.get("reg3d_normal_weight", getattr(args, "reg3d_normal_weight", 0.0))
+    args.reg3d_normal_only_same_group = config.get(
+        "reg3d_normal_only_same_group", getattr(args, "reg3d_normal_only_same_group", True)
+    )
+    args.reg3d_neg_weight = config.get("reg3d_neg_weight", getattr(args, "reg3d_neg_weight", 0.0))
+    args.reg3d_neg_k = config.get("reg3d_neg_k", getattr(args, "reg3d_neg_k", 2))
+    args.reg3d_neg_margin = config.get("reg3d_neg_margin", getattr(args, "reg3d_neg_margin", 0.2))
+    args.use_uncertainty_3d = config.get("use_uncertainty_3d", getattr(args, "use_uncertainty_3d", False))
+    args.use_uncertainty_2d = config.get("use_uncertainty_2d", getattr(args, "use_uncertainty_2d", False))
+    args.anisotropy_mode = config.get("anisotropy_mode", getattr(args, "anisotropy_mode", "ratio"))
+    args.use_anchor_weight = config.get("use_anchor_weight", getattr(args, "use_anchor_weight", True))
+    args.use_neighbor_weight = config.get("use_neighbor_weight", getattr(args, "use_neighbor_weight", True))
+    args.entropy_temperature = config.get("entropy_temperature", getattr(args, "entropy_temperature", 1.0))
+    args.entropy_weight_mode = config.get("entropy_weight_mode", getattr(args, "entropy_weight_mode", "entropy"))
+    args.entropy_min_weight = config.get("entropy_min_weight", getattr(args, "entropy_min_weight", 0.5))
+
+    # -- Engineering split trick -----------------------------------------
+    args.enable_obj_split = config.get("enable_obj_split", getattr(args, "enable_obj_split", False))
+    args.obj_split_interval = config.get("obj_split_interval", getattr(args, "obj_split_interval", 200))
+    args.obj_split_start_iter = config.get("obj_split_start_iter", getattr(args, "obj_split_start_iter", 1000))
+    args.obj_split_end_iter = config.get("obj_split_end_iter", getattr(args, "obj_split_end_iter", 10000))
+    args.obj_split_max_per_step = config.get("obj_split_max_per_step", getattr(args, "obj_split_max_per_step", 2048))
+    args.obj_split_entropy_thresh = config.get("obj_split_entropy_thresh", getattr(args, "obj_split_entropy_thresh", 3.0))
+    args.obj_split_top2_margin = config.get("obj_split_top2_margin", getattr(args, "obj_split_top2_margin", 0.10))
+    args.obj_split_feat_step = config.get("obj_split_feat_step", getattr(args, "obj_split_feat_step", 0.15))
+    args.obj_split_pos_jitter = config.get("obj_split_pos_jitter", getattr(args, "obj_split_pos_jitter", 0.15))
 
     print("Optimizing " + args.model_path)
 

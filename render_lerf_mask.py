@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright (C) 2023, Gaussian-Grouping
 # Gaussian-Grouping research group, https://github.com/lkeab/gaussian-grouping
 # All rights reserved.
@@ -20,6 +22,7 @@ from gaussian_renderer import GaussianModel
 import numpy as np
 from PIL import Image
 import cv2
+from collections import Counter
 
 from ext.grounded_sam import (
     grouned_sam_output,
@@ -48,6 +51,11 @@ def render_set(
     TEXT_PROMPT,
     threshold=0.2,
     debug_prompt_selection=False,
+    vote_views: int = 3,
+    use_mask_gate: bool = True,
+    mask_gate_min_iou: float = 0.2,
+    dino_purity_alpha: float = 0.20,
+    primary_color_bonus: float = 0.35,
 ):
     render_path = os.path.join(
         model_path, name, "ours_{}_text".format(iteration), "renders"
@@ -69,37 +77,210 @@ def render_set(
     if debug_prompt_selection:
         makedirs(debug_path, exist_ok=True)
 
-    # Use Grounded-SAM on the first frame
-    results0 = render(views[0], gaussians, pipeline, background)
-    rendering0 = results0["render"]
-    rendering_obj0 = results0["render_object"]
-    logits = classifier(rendering_obj0)
-    # Use SOFT probabilities for prompt→object-id matching.
-    # Argmax maps can miss small objects entirely (no pixel wins argmax), which
-    # leads to empty selected_obj_ids and all-zero masks.
-    prob0 = torch.softmax(logits, dim=0)
-    pred_obj = torch.argmax(logits, dim=0)
+    def _filter_by_ref_mask(pred_mask_t: torch.Tensor, ref_mask_t: torch.Tensor):
+        """Keep only the connected component best aligned with ref mask.
 
-    image = (rendering0.permute(1, 2, 0) * 255).cpu().numpy().astype("uint8")
-    text_mask, annotated_frame_with_mask = grouned_sam_output(
-        groundingdino_model, sam_predictor, TEXT_PROMPT, image
-    )
-    Image.fromarray(annotated_frame_with_mask).save(
-        os.path.join(render_path[:-8], "grounded-sam---" + TEXT_PROMPT + ".png")
-    )
-    selected_obj_ids = select_obj_ioa(prob0, text_mask)
+        This is a *post* filter to suppress "prompt spill" where the classifier
+        activates multiple objects (e.g. red chair also covers blue chair).
+        We avoid hard intersection (too strict) by selecting the best component.
+        """
 
-    if debug_prompt_selection:
+        if pred_mask_t is None or ref_mask_t is None:
+            return pred_mask_t
+        if (not bool(pred_mask_t.any().item())) or (not bool(ref_mask_t.any().item())):
+            return pred_mask_t
+
+        # If the reference mask is off-target (GroundingDINO mistake), hard
+        # gating will *destroy* a correct prediction. So we only gate when the
+        # reference overlaps the prediction to a minimum extent.
+        overlap = (pred_mask_t & ref_mask_t).sum().float() / (
+            pred_mask_t.sum().float() + 1e-6
+        )
+        if float(overlap.item()) < 0.05:
+            return pred_mask_t
+
+        pred_u8 = (pred_mask_t.detach().cpu().numpy().astype(np.uint8))
+        ref_u8 = (ref_mask_t.detach().cpu().numpy().astype(np.uint8))
+
+        num, labels = cv2.connectedComponents(pred_u8, connectivity=8)
+        if num <= 1:
+            return pred_mask_t
+
+        best_idx = -1
+        best_score = -1.0
+        for i in range(1, num):
+            comp = labels == i
+            comp_area = float(comp.sum())
+            if comp_area < 10:
+                continue
+            inter = float((comp & (ref_u8 > 0)).sum())
+            score = inter / (comp_area + 1e-6)  # precision-like (IOA)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_idx < 0 or best_score < mask_gate_min_iou:
+            return pred_mask_t
+
+        kept = torch.from_numpy((labels == best_idx)).to(pred_mask_t.device)
+        return kept.bool()
+
+    def _pick_ref_mask_by_purity(
+        prob_map: torch.Tensor,
+        masks_all: torch.Tensor,
+        dino_scores=None,
+        image_rgb: np.ndarray | None = None,
+        prompt: str | None = None,
+    ):
+        """Pick the candidate Grounded-SAM mask that best matches a *single* classifier class.
+
+        This uses the classifier prob_map as a judge to avoid GroundingDINO picking
+        the wrong instance when multiple boxes exist.
+
+        Args:
+            prob_map: (C,H,W) softmax over classes
+            masks_all: (B,H,W) bool masks from SAM
+            dino_scores: optional (B,) tensor/cpu list; used as a weak prior
+        """
+        if masks_all is None or masks_all.numel() == 0:
+            return None
+        if masks_all.dim() != 3:
+            return None
+
+        device = prob_map.device
+        masks_f = masks_all.to(device=device, dtype=torch.float32)  # (B,H,W)
+        areas = masks_f.sum(dim=(1, 2)).clamp(min=1.0)  # (B,)
+
+        # class_mass[b,c] = sum_{pixels in mask_b} p_c
+        class_mass = (prob_map.unsqueeze(0) * masks_f.unsqueeze(1)).sum(dim=(2, 3))  # (B,C)
+        best_mass, _ = class_mass.max(dim=1)  # (B,)
+        purity = best_mass / areas  # (B,) in [0,1]
+
+        score = purity
+        if dino_scores is not None:
+            ds = torch.as_tensor(dino_scores, device=device, dtype=torch.float32)
+            if ds.numel() == score.numel():
+                # normalize to [0,1] (roughly) then add as weak prior
+                ds = (ds - ds.min()) / (ds.max() - ds.min() + 1e-6)
+                score = score + float(dino_purity_alpha) * ds
+
+        # If the prompt is of the form "<color> <noun>" (e.g. red apple),
+        # use a cheap color-dominance heuristic to disambiguate instances.
+        if (
+            image_rgb is not None
+            and prompt is not None
+            and isinstance(prompt, str)
+            and len(prompt.split()) > 0
+        ):
+            first = prompt.split()[0].lower()
+            if first in {"red", "green", "blue", "yellow", "white", "black", "brown", "orange", "pink", "purple"}:
+                img = image_rgb
+
+                def _color_score_local(mask_bool: np.ndarray, color: str) -> float:
+                    if mask_bool.sum() < 10:
+                        return 0.0
+                    region = img[mask_bool].astype(np.float32) / 255.0
+                    r = float(region[:, 0].mean())
+                    g = float(region[:, 1].mean())
+                    b = float(region[:, 2].mean())
+                    if color == "red":
+                        s = r - 0.5 * (g + b)
+                    elif color == "green":
+                        s = g - 0.5 * (r + b)
+                    elif color == "blue":
+                        s = b - 0.5 * (r + g)
+                    elif color == "yellow":
+                        s = 0.5 * (r + g) - b
+                    elif color == "white":
+                        s = (r + g + b) / 3.0 - 0.5
+                    elif color == "black":
+                        s = 0.5 - (r + g + b) / 3.0
+                    else:
+                        s = 0.0
+                    return float(np.clip(s, 0.0, 1.0))
+
+                bonus = []
+                masks_np = masks_all.detach().cpu().numpy().astype(bool)
+                for bi in range(masks_np.shape[0]):
+                    bonus.append(_color_score_local(masks_np[bi], first))
+                bonus_t = torch.as_tensor(bonus, device=device, dtype=torch.float32)
+                score = score + float(primary_color_bonus) * bonus_t
+
+        best_i = int(torch.argmax(score).item())
+        return masks_all[best_i].to(device=device).bool()
+
+    # ---------------------------------------------------------------------
+    # Robust prompt→object-id matching
+    #   - Grounded-SAM on multiple views (vote)
+    #   - pick stable object IDs across views
+    # ---------------------------------------------------------------------
+    vote_views_eff = max(1, min(int(vote_views), len(views)))
+    voted_ids = []
+    first_annotated = None
+    first_text_mask0 = None
+    first_prob0 = None
+
+    for vi in range(vote_views_eff):
+        results0 = render(views[vi], gaussians, pipeline, background)
+        rendering0 = results0["render"]
+        rendering_obj0 = results0["render_object"]
+        logits0 = classifier(rendering_obj0)
+        prob0 = torch.softmax(logits0, dim=0)
+
+        image0 = (rendering0.permute(1, 2, 0) * 255).cpu().numpy().astype("uint8")
+        text_mask0, annotated0, masks_all0, dino_scores0 = grouned_sam_output(
+            groundingdino_model,
+            sam_predictor,
+            TEXT_PROMPT,
+            image0,
+            mask_mode="best",
+            return_all=True,
+        )
+
+        # Replace the DINO-chosen mask by a classifier-consistent one.
+        ref0 = _pick_ref_mask_by_purity(
+            prob0,
+            masks_all0,
+            dino_scores0,
+            image_rgb=image0,
+            prompt=TEXT_PROMPT,
+        )
+        if ref0 is not None:
+            text_mask0 = ref0
+        if vi == 0:
+            first_annotated = annotated0
+            first_text_mask0 = text_mask0
+            first_prob0 = prob0
+
+        ids0 = select_obj_ioa(prob0, text_mask0)
+        voted_ids.extend([int(x.item()) for x in ids0])
+
+    if first_annotated is not None:
+        Image.fromarray(first_annotated).save(
+            os.path.join(render_path[:-8], "grounded-sam---" + TEXT_PROMPT + ".png")
+        )
+
+    if voted_ids:
+        cnt = Counter(voted_ids)
+        # keep IDs that appear in >= half of the vote views; fallback to top-1.
+        keep = [cid for cid, c in cnt.items() if c >= (vote_views_eff + 1) // 2]
+        if not keep:
+            keep = [cnt.most_common(1)[0][0]]
+        selected_obj_ids = torch.as_tensor(keep, device=gaussians._xyz.device, dtype=torch.long)
+    else:
+        selected_obj_ids = torch.empty((0,), device=gaussians._xyz.device, dtype=torch.long)
+
+    if debug_prompt_selection and (first_text_mask0 is not None) and (first_prob0 is not None):
         # Report top classes by *soft* IOA for easier debugging.
-        text_mask_f = text_mask.to(torch.float32)
-        inter = (prob0 * text_mask_f.unsqueeze(0)).sum(dim=(1, 2))
-        class_area = prob0.sum(dim=(1, 2)) + 1e-6
+        text_mask_f = first_text_mask0.to(torch.float32)
+        inter = (first_prob0 * text_mask_f.unsqueeze(0)).sum(dim=(1, 2))
+        class_area = first_prob0.sum(dim=(1, 2)) + 1e-6
         ioa = (inter / class_area).detach().cpu().numpy()
         inter_np = inter.detach().cpu().numpy()
         class_area_np = class_area.detach().cpu().numpy()
 
         debug_rows = []
-        for cid in range(prob0.shape[0]):
+        for cid in range(first_prob0.shape[0]):
             debug_rows.append(
                 (
                     int(cid),
@@ -129,6 +310,30 @@ def render_set(
         rendering_obj = results["render_object"]
         logits = classifier(rendering_obj)
 
+        # Optional per-view Grounded-SAM reference mask (for gating).
+        ref_mask_t = None
+        if use_mask_gate:
+            image_ref = (rendering.permute(1, 2, 0) * 255).detach().cpu().numpy().astype("uint8")
+            # Use classifier to select the best candidate mask for this view.
+            prob_ref = torch.softmax(logits, dim=0)
+            ref_mask_t, _, masks_all_ref, dino_scores_ref = grouned_sam_output(
+                groundingdino_model,
+                sam_predictor,
+                TEXT_PROMPT,
+                image_ref,
+                mask_mode="best",
+                return_all=True,
+            )
+            picked = _pick_ref_mask_by_purity(
+                prob_ref,
+                masks_all_ref,
+                dino_scores_ref,
+                image_rgb=image_ref,
+                prompt=TEXT_PROMPT,
+            )
+            if picked is not None:
+                ref_mask_t = picked
+
         if len(selected_obj_ids) > 0:
             prob = torch.softmax(logits, dim=0)
 
@@ -144,6 +349,9 @@ def render_set(
                     pred_obj_mask_t = build_mask(th)
                     if bool(pred_obj_mask_t.any().item()):
                         break
+
+            if use_mask_gate and (ref_mask_t is not None):
+                pred_obj_mask_t = _filter_by_ref_mask(pred_obj_mask_t, ref_mask_t)
 
             pred_obj_mask = (pred_obj_mask_t.squeeze().cpu().numpy() * 255).astype(
                 np.uint8

@@ -16,6 +16,17 @@
     "reg3d_neg_k": 2,
     "reg3d_neg_margin": 0.2,
 
-    "use_uncertainty_3d": false,
-    "use_uncertainty_2d": false
+    "use_uncertainty_3d": true,
+    "use_uncertainty_2d": true,
+    "entropy_min_weight": 0.6,
+
+    "enable_obj_split": true,
+    "obj_split_interval": 200,
+    "obj_split_start_iter": 1200,
+    "obj_split_end_iter": 10000,
+    "obj_split_max_per_step": 2048,
+    "obj_split_entropy_thresh": 3.0,
+    "obj_split_top2_margin": 0.12,
+    "obj_split_feat_step": 0.15,
+    "obj_split_pos_jitter": 0.15
 }

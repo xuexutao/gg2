@@ -595,6 +595,119 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
+    @torch.no_grad()
+    def obj_aware_split(
+        self,
+        classifier,
+        entropy_thresh: float = 3.0,
+        top2_margin: float = 0.10,
+        max_per_step: int = 2048,
+        feat_step: float = 0.15,
+        pos_jitter: float = 0.15,
+        min_opacity: float = 0.02,
+        eps: float = 1e-8,
+    ):
+        """Split ambiguous Gaussians across object boundaries.
+
+        Heuristic:
+          - A Gaussian is "ambiguous" if its per-Gaussian class distribution has
+            high entropy and the top1-top2 probability margin is small.
+          - We split it into two children with small opposite position jitter.
+          - We also nudge the children object features along the classifier
+            weight difference between top1 and top2 classes, so that they
+            specialize to different object IDs.
+
+        This is an engineering-oriented proxy for your "split cross-object
+        Gaussians by boundary" idea without requiring explicit 2D contour
+        backprojection.
+        """
+
+        if classifier is None:
+            return 0
+        if self._objects_dc.numel() == 0:
+            return 0
+
+        device = self._xyz.device
+
+        # (C, N, 1) -> (N, C)
+        logits3d = classifier(self._objects_dc.permute(2, 0, 1))
+        prob = torch.softmax(logits3d, dim=0).squeeze(-1).permute(1, 0)
+
+        # Opacity gate (avoid splitting floaters that will be pruned anyway)
+        opacity = self.get_opacity.squeeze(-1)
+        valid_op = opacity > float(min_opacity)
+        if not bool(valid_op.any().item()):
+            return 0
+
+        # Entropy + top2 margin
+        ent = -(prob * torch.log(prob + eps)).sum(dim=1)  # (N,)
+        top2 = torch.topk(prob, k=2, dim=1)
+        p1 = top2.values[:, 0]
+        p2 = top2.values[:, 1]
+        c1 = top2.indices[:, 0]
+        c2 = top2.indices[:, 1]
+
+        ambiguous = (ent > float(entropy_thresh)) & ((p1 - p2) < float(top2_margin)) & valid_op
+        idx = torch.nonzero(ambiguous, as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            return 0
+
+        if idx.numel() > int(max_per_step):
+            perm = torch.randperm(idx.numel(), device=device)[: int(max_per_step)]
+            idx = idx[perm]
+
+        # Classifier weights: (C, num_objects)
+        W = classifier.weight.squeeze(-1).squeeze(-1)  # (C, F)
+        # Gather per-gaussian direction: w_top1 - w_top2
+        dir_vec = W[c1[idx]] - W[c2[idx]]  # (M, F)
+        dir_norm = torch.norm(dir_vec, dim=1, keepdim=True).clamp(min=eps)
+        dir_vec = dir_vec / dir_norm
+
+        # Object feature tensor: (N, 1, F)
+        obj_feat = self._objects_dc[idx].clone()  # (M,1,F)
+        obj_feat_vec = obj_feat[:, 0, :]  # (M,F)
+        obj_child1 = obj_feat_vec + float(feat_step) * dir_vec
+        obj_child2 = obj_feat_vec - float(feat_step) * dir_vec
+
+        # Position jitter scaled by gaussian size
+        xyz = self.get_xyz[idx]
+        scl = self.get_scaling[idx]
+        # isotropic-ish jitter scale
+        jitter_std = scl.mean(dim=1, keepdim=True) * float(pos_jitter)
+        delta = torch.randn_like(xyz) * jitter_std
+        new_xyz = torch.cat([xyz + delta, xyz - delta], dim=0)
+
+        # Scale shrink like densify_and_split
+        new_scaling = self.scaling_inverse_activation(
+            self.get_scaling[idx].repeat(2, 1) / (0.8 * 2.0)
+        )
+        new_rotation = self._rotation[idx].repeat(2, 1)
+        new_features_dc = self._features_dc[idx].repeat(2, 1, 1)
+        new_features_rest = self._features_rest[idx].repeat(2, 1, 1)
+        new_opacity = self._opacity[idx].repeat(2, 1)
+
+        # New object features
+        new_obj = torch.stack([obj_child1, obj_child2], dim=0).reshape(-1, obj_child1.shape[-1])
+        new_obj = new_obj[:, None, :]  # (2M,1,F)
+
+        # Append children
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_obj,
+        )
+
+        # Prune the original ambiguous points (replace 1 -> 2)
+        prune_mask = torch.zeros((self.get_xyz.shape[0]), device=device, dtype=torch.bool)
+        prune_mask[idx] = True
+        self.prune_points(prune_mask)
+
+        return int(idx.numel())
+
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1

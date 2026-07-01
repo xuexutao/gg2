@@ -121,6 +121,24 @@ class OptimizationParams(ParamGroup):
         self.entropy_weight_mode = "entropy"
         self.entropy_min_weight = 0.5
 
+        # ------------------------------------------------------------------
+        # Object-aware Gaussian split (engineering trick)
+        # ------------------------------------------------------------------
+        # Motivation: some Gaussians sit across object boundaries; their
+        # per-Gaussian class distribution becomes ambiguous (high entropy / top2
+        # close), which later causes prompt masks to spill to other objects.
+        # We explicitly split those Gaussians into two children and nudge their
+        # object features towards the top-2 competing classes.
+        self.enable_obj_split = False
+        self.obj_split_interval = 200
+        self.obj_split_start_iter = 1000
+        self.obj_split_end_iter = 10000
+        self.obj_split_max_per_step = 2048
+        self.obj_split_entropy_thresh = 3.0
+        self.obj_split_top2_margin = 0.10
+        self.obj_split_feat_step = 0.15
+        self.obj_split_pos_jitter = 0.15
+
         super().__init__(parser, "Optimization Parameters")
 
 
